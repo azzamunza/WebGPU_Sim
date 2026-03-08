@@ -168,7 +168,7 @@
 <!-- ══════════════════════════ Canvas ═════════════════════════════════════ -->
 <div id="canvas-wrap">
   <canvas id="gpuCanvas"></canvas>
-  <div id="status">Initialising WebGPU…</div>
+  <div id="status">Initializing WebGPU…</div>
   <div id="fps"></div>
 </div>
 
@@ -416,8 +416,9 @@ fn fs(in : VOut) -> @location(0) vec4f {
   // Soft anti-aliased rim  (hard centre → transparent edge)
   let alpha = 1.0 - smoothstep(0.65, 1.0, d);
 
-  // Add a specular highlight at the top-left
-  let highlight = max(0.0, dot(normalize(in.uv - vec2f(0.5, -0.5)), vec2f(-1.0))) * 0.35;
+  // Add a specular highlight towards the upper-left
+  let lightDir  = normalize(vec2f(-1.0, 1.0));
+  let highlight = max(0.0, dot(normalize(in.uv - vec2f(0.4, -0.4)), lightDir)) * 0.35;
 
   return vec4f(in.color.rgb + highlight, alpha);
 }
@@ -583,7 +584,8 @@ function hsvToRgb(h, s, v) {
     case 4: return [t, p, v];
     case 5: return [v, p, q];
   }
-  return [1, 1, 1];
+  // i % 6 is always 0-5; all cases handled above
+  return [0, 0, 0];
 }
 
 function addParticles(n) {
