@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WebGPU Particle Simulation</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0b0b1a;
+      color: #d0d8f0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    /* ── Controls bar ─────────────────────────────────────────────────── */
+    #controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 18px;
+      padding: 7px 14px;
+      background: #10102a;
+      border-bottom: 1px solid #222255;
+      flex-shrink: 0;
+    }
+
+    .ctrl-group {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .ctrl-group label {
+      font-size: 11px;
+      color: #7788bb;
+      white-space: nowrap;
+    }
+
+    .ctrl-group input[type="number"] {
+      width: 70px;
+      padding: 3px 6px;
+      background: #181832;
+      border: 1px solid #334488;
+      color: #d0d8f0;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .ctrl-group input[type="number"]:focus {
+      outline: none;
+      border-color: #5577ff;
+    }
+
+    .ctrl-group input[type="range"] {
+      width: 110px;
+      accent-color: #4466ee;
+      cursor: pointer;
+    }
+
+    .val-badge {
+      font-size: 11px;
+      min-width: 34px;
+      color: #99aaee;
+    }
+
+    .sep { color: #445; font-size: 12px; }
+
+    button {
+      padding: 4px 13px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: filter 0.15s;
+    }
+    button:hover { filter: brightness(1.25); }
+
+    #addBtn   { background: #2244bb; color: #e8eeff; }
+    #resetBtn { background: #553311; color: #ffddaa; }
+
+    /* ── Canvas area ──────────────────────────────────────────────────── */
+    #canvas-wrap {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    #status {
+      position: absolute;
+      bottom: 8px;
+      left: 10px;
+      font-size: 11px;
+      color: #556699;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #fps {
+      position: absolute;
+      bottom: 8px;
+      right: 10px;
+      font-size: 11px;
+      color: #556699;
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ═══════════════════════════ Controls ══════════════════════════════════ -->
+<div id="controls">
+
+  <!-- Add particles -->
+  <div class="ctrl-group">
+    <label for="numInput">Particles to add:</label>
+    <input type="number" id="numInput" value="200" min="1" max="10000" step="1">
+    <button id="addBtn">Add</button>
+  </div>
+
+  <!-- Reset -->
+  <div class="ctrl-group">
+    <button id="resetBtn">Reset</button>
+  </div>
+
+  <!-- World resolution -->
+  <div class="ctrl-group">
+    <label>World size:</label>
+    <input type="number" id="worldW" value="1920" min="100" max="99999" step="10">
+    <span class="sep">×</span>
+    <input type="number" id="worldH" value="1080" min="100" max="99999" step="10">
+  </div>
+
+  <!-- Falloff range slider -->
+  <div class="ctrl-group">
+    <label for="falloffSlider">Falloff range:</label>
+    <input type="range" id="falloffSlider" min="10" max="800" value="160" step="5">
+    <span class="val-badge" id="falloffBadge">160</span>
+  </div>
+
+  <!-- Vector-field grid size -->
+  <div class="ctrl-group">
+    <label>Grid size:</label>
+    <input type="number" id="gridCols" value="64" min="4" max="256" step="1">
+    <span class="sep">×</span>
+    <input type="number" id="gridRows" value="36" min="4" max="256" step="1">
+  </div>
+
+  <!-- Force slider -->
+  <div class="ctrl-group">
+    <label for="forceSlider">Field force:</label>
+    <input type="range" id="forceSlider" min="0" max="600" value="180" step="1">
+    <span class="val-badge" id="forceBadge">180</span>
+  </div>
+
+</div>
+
+<!-- ══════════════════════════ Canvas ═════════════════════════════════════ -->
+<div id="canvas-wrap">
+  <canvas id="gpuCanvas"></canvas>
+  <div id="status">Initializing WebGPU…</div>
+  <div id="fps"></div>
+</div>
+
+<!-- ══════════════════════════ Script ═════════════════════════════════════ -->
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_PARTICLES  = 10_000;
+const MAX_GRID_DIM   = 256;          // max grid dimension per axis
+const PARTICLE_BYTES = 32;           // vec2f pos + vec2f vel + vec4f color
+const UNIFORM_BYTES  = 48;           // 12 × 4-byte words (padded to 16-byte multiples)
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DOM refs
+// ─────────────────────────────────────────────────────────────────────────────
+const canvas      = document.getElementById('gpuCanvas');
+const statusEl    = document.getElementById('status');
+const fpsEl       = document.getElementById('fps');
+const numInput    = document.getElementById('numInput');
+const worldWInput = document.getElementById('worldW');
+const worldHInput = document.getElementById('worldH');
+const falloffSl   = document.getElementById('falloffSlider');
+const falloffBdg  = document.getElementById('falloffBadge');
+const gridColsIn  = document.getElementById('gridCols');
+const gridRowsIn  = document.getElementById('gridRows');
+const forceSl     = document.getElementById('forceSlider');
+const forceBdg    = document.getElementById('forceBadge');
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Live simulation parameters (updated by UI)
+// ─────────────────────────────────────────────────────────────────────────────
+const sim = {
+  worldWidth:    1920,
+  worldHeight:   1080,
+  gridCols:      64,
+  gridRows:      36,
+  falloffRadius: 160,
+  forceScale:    180,
+  particleRadius: 8,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GPU state
+// ─────────────────────────────────────────────────────────────────────────────
+let device, context, canvasFormat;
+let particleBuf, fieldBuf, uniformBuf;
+let vfPipeline, updatePipeline, renderPipeline;
+let vfBG, updateBG, renderBG;
+
+let particleCount = 0;
+let lastTs = 0;
+let rafId  = null;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — vector-field generation  (compute)
+// ─────────────────────────────────────────────────────────────────────────────
+//  Each grid cell accumulates vortex forces from every particle within
+//  the falloff radius.  The result is written to a flat array of vec2f.
+// ─────────────────────────────────────────────────────────────────────────────
+const VECTOR_FIELD_WGSL = /* wgsl */`
+
+struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
+
+struct Params {
+  worldW   : f32, worldH   : f32,
+  gridCols : u32, gridRows : u32,
+  falloff  : f32, force    : f32,
+  count    : u32, dt       : f32,
+  radius   : f32, _p0      : f32, _p1 : f32, _p2 : f32,
+}
+
+@group(0) @binding(0) var<uniform>             params : Params;
+@group(0) @binding(1) var<storage, read>       pts    : array<Particle>;
+@group(0) @binding(2) var<storage, read_write> field  : array<vec2f>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let col = gid.x;
+  let row = gid.y;
+  if (col >= params.gridCols || row >= params.gridRows) { return; }
+
+  // World-space centre of this cell
+  let cx = (f32(col) + 0.5) / f32(params.gridCols) * params.worldW;
+  let cy = (f32(row) + 0.5) / f32(params.gridRows) * params.worldH;
+  let cellPos = vec2f(cx, cy);
+
+  var force = vec2f(0.0);
+  let R = params.falloff;
+
+  for (var i = 0u; i < params.count; i++) {
+    let d = cellPos - pts[i].pos;
+    let r = length(d);
+    if (r > 0.001 && r < R) {
+      let t = 1.0 - r / R;
+      // Vortex contribution: perpendicular to the radius direction,
+      // weighted by a quadratic falloff that reaches zero at r = R.
+      force += vec2f(-d.y, d.x) / r * (t * t);
+    }
+  }
+
+  // Normalise by particle count so the field amplitude stays consistent
+  // regardless of how many particles are present.
+  field[row * params.gridCols + col] =
+      force / f32(max(params.count, 1u)) * params.force;
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — particle integration  (compute)
+// ─────────────────────────────────────────────────────────────────────────────
+//  Each particle samples the vector field via bilinear interpolation and
+//  integrates its velocity + position with simple Euler + damping.
+// ─────────────────────────────────────────────────────────────────────────────
+const UPDATE_WGSL = /* wgsl */`
+
+struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
+
+struct Params {
+  worldW   : f32, worldH   : f32,
+  gridCols : u32, gridRows : u32,
+  falloff  : f32, force    : f32,
+  count    : u32, dt       : f32,
+  radius   : f32, _p0      : f32, _p1 : f32, _p2 : f32,
+}
+
+@group(0) @binding(0) var<uniform>             params : Params;
+@group(0) @binding(1) var<storage, read_write> pts    : array<Particle>;
+@group(0) @binding(2) var<storage, read>       field  : array<vec2f>;
+
+// Bilinear sample of the vector field at a world-space position.
+fn sampleField(pos : vec2f) -> vec2f {
+  let gx = pos.x / params.worldW * f32(params.gridCols) - 0.5;
+  let gy = pos.y / params.worldH * f32(params.gridRows) - 0.5;
+  let c0 = i32(floor(gx));
+  let r0 = i32(floor(gy));
+  let tx = gx - f32(c0);
+  let ty = gy - f32(r0);
+
+  let maxC = i32(params.gridCols) - 1;
+  let maxR = i32(params.gridRows) - 1;
+
+  let i00 = u32(clamp(r0,   0, maxR)) * params.gridCols + u32(clamp(c0,   0, maxC));
+  let i10 = u32(clamp(r0,   0, maxR)) * params.gridCols + u32(clamp(c0+1, 0, maxC));
+  let i01 = u32(clamp(r0+1, 0, maxR)) * params.gridCols + u32(clamp(c0,   0, maxC));
+  let i11 = u32(clamp(r0+1, 0, maxR)) * params.gridCols + u32(clamp(c0+1, 0, maxC));
+
+  return mix(
+    mix(field[i00], field[i10], tx),
+    mix(field[i01], field[i11], tx),
+    ty
+  );
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
+
+  var pt = pts[idx];
+
+  // Integrate velocity from the field force
+  pt.vel = pt.vel * 0.98 + sampleField(pt.pos) * params.dt;
+
+  // Clamp speed to 40 % of world width per second
+  let spd = length(pt.vel);
+  let cap = params.worldW * 0.4;
+  if (spd > cap) { pt.vel = pt.vel / spd * cap; }
+
+  // Euler position step
+  pt.pos = pt.pos + pt.vel * params.dt;
+
+  // Wrap around world edges
+  if (pt.pos.x < 0.0)            { pt.pos.x += params.worldW; }
+  if (pt.pos.x >= params.worldW) { pt.pos.x -= params.worldW; }
+  if (pt.pos.y < 0.0)            { pt.pos.y += params.worldH; }
+  if (pt.pos.y >= params.worldH) { pt.pos.y -= params.worldH; }
+
+  pts[idx] = pt;
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — render  (vertex + fragment)
+// ─────────────────────────────────────────────────────────────────────────────
+//  Each particle is an instanced 6-vertex quad; the fragment shader clips
+//  to a unit circle and applies a smooth anti-aliased edge.
+// ─────────────────────────────────────────────────────────────────────────────
+const RENDER_WGSL = /* wgsl */`
+
+struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
+
+struct Params {
+  worldW   : f32, worldH   : f32,
+  gridCols : u32, gridRows : u32,
+  falloff  : f32, force    : f32,
+  count    : u32, dt       : f32,
+  radius   : f32, _p0      : f32, _p1 : f32, _p2 : f32,
+}
+
+@group(0) @binding(0) var<uniform>       params : Params;
+@group(0) @binding(1) var<storage, read> pts    : array<Particle>;
+
+struct VOut {
+  @builtin(position) pos   : vec4f,
+  @location(0)       uv    : vec2f,
+  @location(1)       color : vec4f,
+}
+
+// Two-triangle quad corners (triangle-list, 6 vertices)
+var<private> QUAD : array<vec2f, 6> = array<vec2f, 6>(
+  vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+  vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0),
+);
+
+@vertex
+fn vs(
+  @builtin(vertex_index)   vi : u32,
+  @builtin(instance_index) ii : u32,
+) -> VOut {
+  let corner   = QUAD[vi];
+  let pt       = pts[ii];
+  let worldPos = pt.pos + corner * params.radius;
+
+  // Map world-space → NDC  (y is flipped because world-y grows downward)
+  let ndc = vec2f(
+     worldPos.x / params.worldW * 2.0 - 1.0,
+    -worldPos.y / params.worldH * 2.0 + 1.0,
+  );
+
+  var out : VOut;
+  out.pos   = vec4f(ndc, 0.0, 1.0);
+  out.uv    = corner;
+  out.color = pt.color;
+  return out;
+}
+
+@fragment
+fn fs(in : VOut) -> @location(0) vec4f {
+  let d = length(in.uv);
+  if (d > 1.0) { discard; }
+
+  // Soft anti-aliased rim  (hard centre → transparent edge)
+  let alpha = 1.0 - smoothstep(0.65, 1.0, d);
+
+  // Add a specular highlight towards the upper-left
+  let lightDir  = normalize(vec2f(-1.0, 1.0));
+  let highlight = max(0.0, dot(normalize(in.uv - vec2f(0.4, -0.4)), lightDir)) * 0.35;
+
+  return vec4f(in.color.rgb + highlight, alpha);
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WebGPU initialisation
+// ─────────────────────────────────────────────────────────────────────────────
+async function initGPU() {
+  if (!navigator.gpu) {
+    throw new Error('WebGPU is not supported in this browser.');
+  }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter found.');
+
+  device = await adapter.requestDevice();
+  device.lost.then(info => {
+    setStatus(`GPU device lost: ${info.message}. Please refresh.`);
+  });
+
+  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  context = canvas.getContext('webgpu');
+  reconfigureContext();
+}
+
+function reconfigureContext() {
+  context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Buffer creation  (called once; all buffers are pre-allocated to maximum size)
+// ─────────────────────────────────────────────────────────────────────────────
+function createBuffers() {
+  particleBuf = device.createBuffer({
+    label: 'particles',
+    size:  MAX_PARTICLES * PARTICLE_BYTES,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  // vec2f = 8 bytes; pre-allocate for the largest possible grid
+  fieldBuf = device.createBuffer({
+    label: 'vectorField',
+    size:  MAX_GRID_DIM * MAX_GRID_DIM * 8,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  uniformBuf = device.createBuffer({
+    label: 'uniforms',
+    size:  UNIFORM_BYTES,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Pipeline creation
+// ─────────────────────────────────────────────────────────────────────────────
+function createPipelines() {
+  const vfMod     = device.createShaderModule({ code: VECTOR_FIELD_WGSL });
+  const updateMod = device.createShaderModule({ code: UPDATE_WGSL });
+  const renderMod = device.createShaderModule({ code: RENDER_WGSL });
+
+  vfPipeline = device.createComputePipeline({
+    layout:  'auto',
+    compute: { module: vfMod, entryPoint: 'main' },
+  });
+
+  updatePipeline = device.createComputePipeline({
+    layout:  'auto',
+    compute: { module: updateMod, entryPoint: 'main' },
+  });
+
+  renderPipeline = device.createRenderPipeline({
+    layout:   'auto',
+    vertex:   { module: renderMod, entryPoint: 'vs' },
+    fragment: {
+      module:  renderMod,
+      entryPoint: 'fs',
+      targets: [{
+        format: canvasFormat,
+        blend: {
+          color: {
+            srcFactor: 'src-alpha',
+            dstFactor: 'one-minus-src-alpha',
+            operation: 'add',
+          },
+          alpha: {
+            srcFactor: 'one',
+            dstFactor: 'one-minus-src-alpha',
+            operation: 'add',
+          },
+        },
+      }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bind-group creation  (only needs to happen once because buffers never change)
+// ─────────────────────────────────────────────────────────────────────────────
+function createBindGroups() {
+  vfBG = device.createBindGroup({
+    layout:  vfPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf   } },
+      { binding: 1, resource: { buffer: particleBuf  } },
+      { binding: 2, resource: { buffer: fieldBuf     } },
+    ],
+  });
+
+  updateBG = device.createBindGroup({
+    layout:  updatePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf   } },
+      { binding: 1, resource: { buffer: particleBuf  } },
+      { binding: 2, resource: { buffer: fieldBuf     } },
+    ],
+  });
+
+  renderBG = device.createBindGroup({
+    layout:  renderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf  } },
+      { binding: 1, resource: { buffer: particleBuf } },
+    ],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Uniform upload
+// ─────────────────────────────────────────────────────────────────────────────
+const _uniformAB = new ArrayBuffer(UNIFORM_BYTES);
+const _uniformDV = new DataView(_uniformAB);
+
+function uploadUniforms(dt) {
+  _uniformDV.setFloat32( 0, sim.worldWidth,    true);
+  _uniformDV.setFloat32( 4, sim.worldHeight,   true);
+  _uniformDV.setUint32 ( 8, sim.gridCols,      true);
+  _uniformDV.setUint32 (12, sim.gridRows,      true);
+  _uniformDV.setFloat32(16, sim.falloffRadius, true);
+  _uniformDV.setFloat32(20, sim.forceScale,    true);
+  _uniformDV.setUint32 (24, particleCount,     true);
+  _uniformDV.setFloat32(28, dt,                true);
+  _uniformDV.setFloat32(32, sim.particleRadius,true);
+  // bytes 36–47: padding (already zero-initialised)
+  device.queue.writeBuffer(uniformBuf, 0, _uniformAB);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Particle helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function hsvToRgb(h, s, v) {
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: return [v, t, p];
+    case 1: return [q, v, p];
+    case 2: return [p, v, t];
+    case 3: return [p, q, v];
+    case 4: return [t, p, v];
+    case 5: return [v, p, q];
+  }
+  // i % 6 is always 0-5; all cases handled above
+  return [0, 0, 0];
+}
+
+function addParticles(n) {
+  const toAdd = Math.min(n, MAX_PARTICLES - particleCount);
+  if (toAdd <= 0) {
+    setStatus(`Maximum of ${MAX_PARTICLES} particles reached.`);
+    return;
+  }
+
+  const f32 = new Float32Array(toAdd * 8);  // 8 floats per particle
+  for (let i = 0; i < toAdd; i++) {
+    const b = i * 8;
+    f32[b + 0] = Math.random() * sim.worldWidth;   // pos.x
+    f32[b + 1] = Math.random() * sim.worldHeight;  // pos.y
+    f32[b + 2] = 0;                                 // vel.x
+    f32[b + 3] = 0;                                 // vel.y
+    const [r, g, bl] = hsvToRgb(Math.random(), 0.85, 1.0);
+    f32[b + 4] = r;   // color.r
+    f32[b + 5] = g;   // color.g
+    f32[b + 6] = bl;  // color.b
+    f32[b + 7] = 1;   // color.a
+  }
+
+  device.queue.writeBuffer(particleBuf, particleCount * PARTICLE_BYTES, f32.buffer);
+  particleCount += toAdd;
+  setStatus(`Particles: ${particleCount}`);
+}
+
+function resetSim() {
+  particleCount = 0;
+  // Zero out both GPU buffers so stale data does not persist
+  device.queue.writeBuffer(particleBuf, 0, new Uint8Array(MAX_PARTICLES * PARTICLE_BYTES));
+  device.queue.writeBuffer(fieldBuf,    0, new Uint8Array(MAX_GRID_DIM * MAX_GRID_DIM * 8));
+  setStatus('Simulation reset.');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Render loop
+// ─────────────────────────────────────────────────────────────────────────────
+let fpsFrames = 0, fpsAccum = 0;
+
+function frame(ts) {
+  const dt = lastTs === 0 ? 1 / 60 : Math.min((ts - lastTs) / 1000, 1 / 20);
+  lastTs = ts;
+
+  // FPS counter
+  fpsFrames++;
+  fpsAccum += dt;
+  if (fpsAccum >= 1.0) {
+    fpsEl.textContent = `${Math.round(fpsFrames / fpsAccum)} fps`;
+    fpsFrames = 0;
+    fpsAccum  = 0;
+  }
+
+  uploadUniforms(dt);
+
+  const enc = device.createCommandEncoder();
+
+  if (particleCount > 0) {
+    // ── Pass 1: generate vector field ─────────────────────────────────────
+    const vfPass = enc.beginComputePass({ label: 'vectorField' });
+    vfPass.setPipeline(vfPipeline);
+    vfPass.setBindGroup(0, vfBG);
+    vfPass.dispatchWorkgroups(
+      Math.ceil(sim.gridCols / 8),
+      Math.ceil(sim.gridRows / 8),
+    );
+    vfPass.end();
+
+    // ── Pass 2: integrate particles ────────────────────────────────────────
+    const upPass = enc.beginComputePass({ label: 'updateParticles' });
+    upPass.setPipeline(updatePipeline);
+    upPass.setBindGroup(0, updateBG);
+    upPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
+    upPass.end();
+  }
+
+  // ── Pass 3: render ─────────────────────────────────────────────────────
+  const renderPass = enc.beginRenderPass({
+    colorAttachments: [{
+      view:       context.getCurrentTexture().createView(),
+      clearValue: { r: 0.04, g: 0.04, b: 0.10, a: 1.0 },
+      loadOp:     'clear',
+      storeOp:    'store',
+    }],
+  });
+
+  if (particleCount > 0) {
+    renderPass.setPipeline(renderPipeline);
+    renderPass.setBindGroup(0, renderBG);
+    // 6 vertices per instance (two-triangle quad), one instance per particle
+    renderPass.draw(6, particleCount);
+  }
+  renderPass.end();
+
+  device.queue.submit([enc.finish()]);
+
+  rafId = requestAnimationFrame(frame);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Canvas resize
+// ─────────────────────────────────────────────────────────────────────────────
+function resizeCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  canvas.width  = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+  if (device && context) reconfigureContext();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UI wiring
+// ─────────────────────────────────────────────────────────────────────────────
+function wireUI() {
+  document.getElementById('addBtn').addEventListener('click', () => {
+    const n = parseInt(numInput.value, 10);
+    if (n > 0) addParticles(n);
+  });
+
+  document.getElementById('resetBtn').addEventListener('click', resetSim);
+
+  worldWInput.addEventListener('change', () => {
+    sim.worldWidth = Math.max(100, parseInt(worldWInput.value, 10) || 1920);
+  });
+  worldHInput.addEventListener('change', () => {
+    sim.worldHeight = Math.max(100, parseInt(worldHInput.value, 10) || 1080);
+  });
+
+  falloffSl.addEventListener('input', () => {
+    sim.falloffRadius = parseInt(falloffSl.value, 10);
+    falloffBdg.textContent = falloffSl.value;
+  });
+
+  gridColsIn.addEventListener('change', () => {
+    sim.gridCols = Math.min(MAX_GRID_DIM, Math.max(4, parseInt(gridColsIn.value, 10) || 64));
+  });
+  gridRowsIn.addEventListener('change', () => {
+    sim.gridRows = Math.min(MAX_GRID_DIM, Math.max(4, parseInt(gridRowsIn.value, 10) || 36));
+  });
+
+  forceSl.addEventListener('input', () => {
+    sim.forceScale = parseInt(forceSl.value, 10);
+    forceBdg.textContent = forceSl.value;
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Status helper
+// ─────────────────────────────────────────────────────────────────────────────
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Entry point
+// ─────────────────────────────────────────────────────────────────────────────
+(async () => {
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+  wireUI();
+
+  try {
+    await initGPU();
+    createBuffers();
+    createPipelines();
+    createBindGroups();
+
+    // Seed an initial set of particles so the page is immediately interesting
+    addParticles(300);
+    setStatus(`Particles: ${particleCount}  — use the controls above to add more.`);
+
+    rafId = requestAnimationFrame(frame);
+  } catch (err) {
+    setStatus(`Error: ${err.message}`);
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>
