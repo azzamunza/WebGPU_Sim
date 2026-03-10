@@ -1,0 +1,2107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FLIP Cell Simulation</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #0b0b1a;
+      color: #d0d8f0;
+      font-family: 'Segoe UI', Arial, sans-serif;
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+      overflow: hidden;
+    }
+
+    #controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px 18px;
+      padding: 7px 14px;
+      background: #10102a;
+      border-bottom: 1px solid #222255;
+      flex-shrink: 0;
+    }
+
+    .ctrl-group {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+
+    .ctrl-group label {
+      font-size: 11px;
+      color: #7788bb;
+      white-space: nowrap;
+    }
+
+    .ctrl-group input[type="number"] {
+      width: 70px;
+      padding: 3px 6px;
+      background: #181832;
+      border: 1px solid #334488;
+      color: #d0d8f0;
+      border-radius: 4px;
+      font-size: 12px;
+    }
+    .ctrl-group input[type="number"]:focus {
+      outline: none;
+      border-color: #5577ff;
+    }
+
+    .ctrl-group input[type="range"] {
+      width: 110px;
+      accent-color: #4466ee;
+      cursor: pointer;
+    }
+
+    .val-badge {
+      font-size: 11px;
+      min-width: 34px;
+      color: #99aaee;
+    }
+
+    .sep { color: #445; font-size: 12px; }
+
+    button {
+      padding: 4px 13px;
+      border: none;
+      border-radius: 4px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: filter 0.15s;
+    }
+    button:hover { filter: brightness(1.25); }
+
+    #addBtn   { background: #2244bb; color: #e8eeff; }
+    #resetBtn { background: #553311; color: #ffddaa; }
+
+    .ctrl-group input[type="checkbox"] {
+      accent-color: #4466ee;
+      cursor: pointer;
+      width: 14px;
+      height: 14px;
+    }
+
+    #canvas-wrap {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }
+
+    #status {
+      position: absolute;
+      bottom: 8px;
+      left: 10px;
+      font-size: 11px;
+      color: #556699;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    #fps {
+      position: absolute;
+      bottom: 8px;
+      right: 10px;
+      font-size: 11px;
+      color: #556699;
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+
+<div id="controls">
+  <div class="ctrl-group">
+    <label for="numInput">Particles to add:</label>
+    <input type="number" id="numInput" value="200" min="1" max="10000" step="1">
+    <button id="addBtn">Add</button>
+  </div>
+
+  <div class="ctrl-group">
+    <button id="resetBtn">Reset</button>
+  </div>
+
+  <div class="ctrl-group">
+    <label>World size:</label>
+    <input type="number" id="worldW" value="1920" min="100" max="99999" step="10">
+    <span class="sep">×</span>
+    <input type="number" id="worldH" value="1080" min="100" max="99999" step="10">
+  </div>
+
+  <div class="ctrl-group">
+    <label>Grid size:</label>
+    <input type="number" id="gridCols" value="64" min="4" max="256" step="1">
+    <span class="sep">×</span>
+    <input type="number" id="gridRows" value="36" min="4" max="256" step="1">
+  </div>
+
+  <div class="ctrl-group">
+    <label for="gravitySlider">Gravity:</label>
+    <input type="range" id="gravitySlider" min="0" max="2000" value="0" step="10">
+    <span class="val-badge" id="gravityBadge">0</span>
+  </div>
+
+  <div class="ctrl-group">
+    <label for="flipSlider">FLIP ratio:</label>
+    <input type="range" id="flipSlider" min="0" max="100" value="95" step="1">
+    <span class="val-badge" id="flipBadge">0.95</span>
+  </div>
+
+  <div class="ctrl-group">
+    <label for="repulsionSlider">Repulsion:</label>
+    <input type="range" id="repulsionSlider" min="0" max="2000" value="500" step="10">
+    <span class="val-badge" id="repulsionBadge">500</span>
+  </div>
+
+  <div class="ctrl-group">
+    <label for="borderSlider">Border push:</label>
+    <input type="range" id="borderSlider" min="0" max="2000" value="200" step="10">
+    <span class="val-badge" id="borderBadge">200</span>
+  </div>
+
+  <div class="ctrl-group">
+    <label for="vfOverlay">Velocity field:</label>
+    <input type="checkbox" id="vfOverlay">
+  </div>
+
+  <div class="ctrl-group">
+    <button id="cellBtn" style="background:#225544;color:#aaffcc">Add Cell</button>
+  </div>
+</div>
+
+<div id="canvas-wrap">
+  <canvas id="gpuCanvas"></canvas>
+  <div id="status">Initializing WebGPU…</div>
+  <div id="fps"></div>
+</div>
+
+<script>
+'use strict';
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Constants
+// ─────────────────────────────────────────────────────────────────────────────
+const MAX_PARTICLES   = 50_000;
+const MAX_GRID_DIM    = 256;
+const PARTICLE_BYTES  = 32;          // vec2f pos + vec2f vel + vec4f color
+const CELL_LINK_BYTES = 32;
+const MEMBRANE_SIZE   = 40;
+const FLAGELLA_COUNT  = 8;
+const FLAGELLA_LENGTH = 7;
+const INJECTOR_COUNT  = 4;
+const JACOBI_ITERS    = 40;         // pressure solve iterations per frame
+
+// Uniform layout: 16 f32/u32 = 64 bytes
+const UNIFORM_BYTES   = 64;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  DOM refs
+// ─────────────────────────────────────────────────────────────────────────────
+const canvas      = document.getElementById('gpuCanvas');
+const statusEl    = document.getElementById('status');
+const fpsEl       = document.getElementById('fps');
+const numInput    = document.getElementById('numInput');
+const worldWInput = document.getElementById('worldW');
+const worldHInput = document.getElementById('worldH');
+const gridColsIn  = document.getElementById('gridCols');
+const gridRowsIn  = document.getElementById('gridRows');
+const gravitySl   = document.getElementById('gravitySlider');
+const gravityBdg  = document.getElementById('gravityBadge');
+const flipSl      = document.getElementById('flipSlider');
+const flipBdg     = document.getElementById('flipBadge');
+const repulsionSl  = document.getElementById('repulsionSlider');
+const repulsionBdg = document.getElementById('repulsionBadge');
+const borderSl     = document.getElementById('borderSlider');
+const borderBdg    = document.getElementById('borderBadge');
+const vfOverlayCb  = document.getElementById('vfOverlay');
+const cellBtn      = document.getElementById('cellBtn');
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Live simulation parameters
+// ─────────────────────────────────────────────────────────────────────────────
+const sim = {
+  worldWidth:    1920,
+  worldHeight:   1080,
+  gridCols:      64,
+  gridRows:      36,
+  gravity:       0,
+  flipRatio:     0.95,
+  particleRadius: 8,
+  repulsion:     500,
+  borderForce:   200,
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  GPU state
+// ─────────────────────────────────────────────────────────────────────────────
+let device, context, canvasFormat;
+// Particle buffers
+let particleBuf, cellLinkBuf, injectorTimerBuf;
+// FLIP grid buffers (MAC staggered grid)
+let uVelBuf, vVelBuf;          // current f32 velocities
+let uVelOldBuf, vVelOldBuf;    // saved pre-solve velocities (for FLIP delta)
+let uAccumBuf, vAccumBuf;      // atomic i32 accumulators (velocity × weight, fixed-point)
+let uWAccumBuf, vWAccumBuf;    // atomic i32 accumulators (weight, fixed-point)
+let pressureBuf, pressureTempBuf; // double-buffered pressure for Jacobi
+let divergenceBuf;              // divergence
+let cellTypeBuf;                // 0=air, 1=fluid, 2=solid
+let uniformBuf;
+
+// Pipelines
+let clearGridPipeline, p2gPipeline, normalisePipeline, markCellsPipeline;
+let addGravityPipeline, solvePressurePipeline, projectPipeline;
+let g2pPipeline, updatePipeline;
+let renderPipeline, arrowPipeline;
+
+// Bind groups
+let clearGridBG, p2gBG, normaliseBG, markCellsBG;
+let addGravityBG;
+let solvePressureBG_A, solvePressureBG_B;   // ping-pong
+let projectBG;
+let g2pBG, updateBG;
+let renderBG, arrowBG;
+
+let showVectorField = false;
+let placingCell     = false;
+let particleCount   = 0;
+let lastTs = 0;
+let rafId  = null;
+let simTime = 0;
+
+// Grid sizes for MAC staggered grid
+function uCount() { return (sim.gridCols + 1) * sim.gridRows; }
+function vCount() { return sim.gridCols * (sim.gridRows + 1); }
+function cellCount() { return sim.gridCols * sim.gridRows; }
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — shared struct definitions
+// ─────────────────────────────────────────────────────────────────────────────
+const WGSL_STRUCTS = /* wgsl */`
+struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
+
+struct Params {
+  worldW     : f32,
+  worldH     : f32,
+  gridCols   : u32,
+  gridRows   : u32,
+  cellW      : f32,
+  cellH      : f32,
+  count      : u32,
+  dt         : f32,
+  radius     : f32,
+  repulsion  : f32,
+  borderForce: f32,
+  time       : f32,
+  gravity    : f32,
+  flipRatio  : f32,
+  pad0       : f32,
+  pad1       : f32,
+}
+
+struct CellLink {
+  prev      : u32,
+  next      : u32,
+  restDist  : f32,
+  restAngle : f32,
+  cellStart : u32,
+  cellSize  : u32,
+  chainIdx  : u32,
+  ptype     : u32,
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Clear grid (zero accumulators, velocities, pressure, divergence)
+// ─────────────────────────────────────────────────────────────────────────────
+const CLEAR_GRID_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform> params : Params;
+@group(0) @binding(1) var<storage, read_write> uAccum    : array<atomic<i32>>;
+@group(0) @binding(2) var<storage, read_write> vAccum    : array<atomic<i32>>;
+@group(0) @binding(3) var<storage, read_write> uWAccum   : array<atomic<i32>>;
+@group(0) @binding(4) var<storage, read_write> vWAccum   : array<atomic<i32>>;
+@group(0) @binding(5) var<storage, read_write> pressure  : array<f32>;
+@group(0) @binding(6) var<storage, read_write> divergence: array<f32>;
+@group(0) @binding(7) var<storage, read_write> cellType  : array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  let uSize = (params.gridCols + 1u) * params.gridRows;
+  let vSize = params.gridCols * (params.gridRows + 1u);
+  let cSize = params.gridCols * params.gridRows;
+
+  if (idx < uSize) {
+    atomicStore(&uAccum[idx],  0);
+    atomicStore(&uWAccum[idx], 0);
+  }
+  if (idx < vSize) {
+    atomicStore(&vAccum[idx],  0);
+    atomicStore(&vWAccum[idx], 0);
+  }
+  if (idx < cSize) {
+    pressure[idx]   = 0.0;
+    divergence[idx] = 0.0;
+    cellType[idx]   = 0u;   // air
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — P2G: scatter particle velocities onto MAC grid using atomics
+//  We use atomicAdd on i32 with a fixed-point encoding (×1024) since
+//  WebGPU doesn't have atomicAdd for f32.
+// ─────────────────────────────────────────────────────────────────────────────
+const P2G_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params    : Params;
+@group(0) @binding(1) var<storage, read>       pts       : array<Particle>;
+@group(0) @binding(2) var<storage, read_write> uAccum    : array<atomic<i32>>;
+@group(0) @binding(3) var<storage, read_write> vAccum    : array<atomic<i32>>;
+@group(0) @binding(4) var<storage, read_write> uWAccum   : array<atomic<i32>>;
+@group(0) @binding(5) var<storage, read_write> vWAccum   : array<atomic<i32>>;
+@group(0) @binding(6) var<storage, read>       cellLinks : array<CellLink>;
+
+const FP_SCALE : f32 = 1024.0;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
+
+  let link = cellLinks[idx];
+  // Absorbed particles don't contribute to fluid
+  if (link.ptype == 4u) { return; }
+
+  let pt = pts[idx];
+  let px = pt.pos.x / params.cellW;
+  let py = pt.pos.y / params.cellH;
+
+  // ── Splat to u-velocity grid (staggered: u lives at left cell edges)
+  // u-grid is (gridCols+1) × gridRows, sample point offset by (0, 0.5)
+  {
+    let sx = px;              // u-face x: integer = left edge of cell
+    let sy = py - 0.5;       // u-face y: centered vertically
+    let i0 = i32(floor(sx));
+    let j0 = i32(floor(sy));
+    let fx = sx - f32(i0);
+    let fy = sy - f32(j0);
+
+    let uCols = i32(params.gridCols) + 1;
+    let uRows = i32(params.gridRows);
+
+    for (var di = 0; di <= 1; di++) {
+      for (var dj = 0; dj <= 1; dj++) {
+        let ci = i0 + di;
+        let cj = j0 + dj;
+        if (ci >= 0 && ci < uCols && cj >= 0 && cj < uRows) {
+          let wx = select(1.0 - fx, fx, di == 1);
+          let wy = select(1.0 - fy, fy, dj == 1);
+          let w = wx * wy;
+          let gIdx = u32(cj * uCols + ci);
+          atomicAdd(&uAccum[gIdx],  i32(pt.vel.x * w * FP_SCALE));
+          atomicAdd(&uWAccum[gIdx], i32(w * FP_SCALE));
+        }
+      }
+    }
+  }
+
+  // ── Splat to v-velocity grid (staggered: v lives at bottom cell edges)
+  // v-grid is gridCols × (gridRows+1), sample point offset by (0.5, 0)
+  {
+    let sx = px - 0.5;       // v-face x: centered horizontally
+    let sy = py;              // v-face y: integer = bottom edge of cell
+    let i0 = i32(floor(sx));
+    let j0 = i32(floor(sy));
+    let fx = sx - f32(i0);
+    let fy = sy - f32(j0);
+
+    let vCols = i32(params.gridCols);
+    let vRows = i32(params.gridRows) + 1;
+
+    for (var di = 0; di <= 1; di++) {
+      for (var dj = 0; dj <= 1; dj++) {
+        let ci = i0 + di;
+        let cj = j0 + dj;
+        if (ci >= 0 && ci < vCols && cj >= 0 && cj < vRows) {
+          let wx = select(1.0 - fx, fx, di == 1);
+          let wy = select(1.0 - fy, fy, dj == 1);
+          let w = wx * wy;
+          let gIdx = u32(cj * vCols + ci);
+          atomicAdd(&vAccum[gIdx],  i32(pt.vel.y * w * FP_SCALE));
+          atomicAdd(&vWAccum[gIdx], i32(w * FP_SCALE));
+        }
+      }
+    }
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Normalise P2G results + mark fluid cells + save old velocities
+// ─────────────────────────────────────────────────────────────────────────────
+const NORMALISE_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params    : Params;
+@group(0) @binding(1) var<storage, read_write> uVel      : array<f32>;
+@group(0) @binding(2) var<storage, read_write> vVel      : array<f32>;
+@group(0) @binding(3) var<storage, read>       uAccum    : array<i32>;
+@group(0) @binding(4) var<storage, read>       vAccum    : array<i32>;
+@group(0) @binding(5) var<storage, read>       uWAccum   : array<i32>;
+@group(0) @binding(6) var<storage, read>       vWAccum   : array<i32>;
+@group(0) @binding(7) var<storage, read_write> uVelOld   : array<f32>;
+@group(0) @binding(8) var<storage, read_write> vVelOld   : array<f32>;
+
+const FP_SCALE : f32 = 1024.0;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+
+  // Normalise u-velocity from fixed-point accumulators
+  let uSize = (params.gridCols + 1u) * params.gridRows;
+  if (idx < uSize) {
+    let w = f32(uWAccum[idx]);
+    if (w > 0.5) {
+      uVel[idx] = f32(uAccum[idx]) / w;
+    } else {
+      uVel[idx] = 0.0;
+    }
+    uVelOld[idx] = uVel[idx];
+  }
+
+  // Normalise v-velocity
+  let vSize = params.gridCols * (params.gridRows + 1u);
+  if (idx < vSize) {
+    let w = f32(vWAccum[idx]);
+    if (w > 0.5) {
+      vVel[idx] = f32(vAccum[idx]) / w;
+    } else {
+      vVel[idx] = 0.0;
+    }
+    vVelOld[idx] = vVel[idx];
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Mark fluid cells (separate pass to stay within binding limits)
+// ─────────────────────────────────────────────────────────────────────────────
+const MARK_CELLS_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params   : Params;
+@group(0) @binding(1) var<storage, read>       pts      : array<Particle>;
+@group(0) @binding(2) var<storage, read_write> cellType : array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
+
+  let p = pts[idx].pos;
+  let ci = u32(clamp(p.x / params.cellW, 0.0, f32(params.gridCols) - 1.0));
+  let cj = u32(clamp(p.y / params.cellH, 0.0, f32(params.gridRows) - 1.0));
+  cellType[cj * params.gridCols + ci] = 1u;  // fluid
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Add gravity + boundary conditions on grid
+// ─────────────────────────────────────────────────────────────────────────────
+const ADD_GRAVITY_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params : Params;
+@group(0) @binding(1) var<storage, read_write> uVel   : array<f32>;
+@group(0) @binding(2) var<storage, read_write> vVel   : array<f32>;
+@group(0) @binding(3) var<storage, read>       cellType : array<u32>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  let vSize = params.gridCols * (params.gridRows + 1u);
+
+  // Add gravity to v-velocities
+  if (idx < vSize) {
+    let col = idx % params.gridCols;
+    let row = idx / params.gridCols;
+
+    // Only add gravity at faces bordering fluid
+    var isFluid = false;
+    if (row > 0u) {
+      let cBelow = (row - 1u) * params.gridCols + col;
+      if (cellType[cBelow] == 1u) { isFluid = true; }
+    }
+    if (row < params.gridRows) {
+      let cAbove = row * params.gridCols + col;
+      if (cAbove < params.gridCols * params.gridRows && cellType[cAbove] == 1u) { isFluid = true; }
+    }
+
+    if (isFluid) {
+      vVel[idx] += params.gravity * params.dt;
+    }
+  }
+
+  // Enforce solid boundary (zero velocity at domain edges)
+  let uCols = params.gridCols + 1u;
+  let uSize = uCols * params.gridRows;
+  if (idx < uSize) {
+    let col = idx % uCols;
+    if (col == 0u || col == params.gridCols) {
+      uVel[idx] = 0.0;
+    }
+  }
+  if (idx < vSize) {
+    let row = idx / params.gridCols;
+    if (row == 0u || row == params.gridRows) {
+      vVel[idx] = 0.0;
+    }
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Pressure solve (Jacobi iteration)
+//  Computes divergence then iteratively solves ∇²p = divergence
+// ─────────────────────────────────────────────────────────────────────────────
+const SOLVE_PRESSURE_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params     : Params;
+@group(0) @binding(1) var<storage, read>       uVel       : array<f32>;
+@group(0) @binding(2) var<storage, read>       vVel       : array<f32>;
+@group(0) @binding(3) var<storage, read>       cellType   : array<u32>;
+@group(0) @binding(4) var<storage, read>       pressureIn : array<f32>;
+@group(0) @binding(5) var<storage, read_write> pressureOut: array<f32>;
+@group(0) @binding(6) var<storage, read_write> divergence : array<f32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let col = gid.x;
+  let row = gid.y;
+  if (col >= params.gridCols || row >= params.gridRows) { return; }
+
+  let idx = row * params.gridCols + col;
+
+  // Only solve in fluid cells
+  if (cellType[idx] != 1u) {
+    pressureOut[idx] = 0.0;
+    return;
+  }
+
+  let uCols = params.gridCols + 1u;
+
+  // Compute velocity divergence for this cell
+  let uRight = uVel[row * uCols + col + 1u];
+  let uLeft  = uVel[row * uCols + col];
+  let vTop   = vVel[(row + 1u) * params.gridCols + col];
+  let vBot   = vVel[row * params.gridCols + col];
+
+  let div = (uRight - uLeft) / params.cellW + (vTop - vBot) / params.cellH;
+  divergence[idx] = div;
+
+  // Count non-solid neighbours and sum their pressure
+  var sumP = 0.0;
+  var numNeighbours = 0.0;
+
+  // Left
+  if (col > 0u) {
+    let nIdx = row * params.gridCols + col - 1u;
+    if (cellType[nIdx] != 2u) { sumP += pressureIn[nIdx]; numNeighbours += 1.0; }
+  } else { numNeighbours += 1.0; } // solid wall treated as zero pressure gradient
+
+  // Right
+  if (col < params.gridCols - 1u) {
+    let nIdx = row * params.gridCols + col + 1u;
+    if (cellType[nIdx] != 2u) { sumP += pressureIn[nIdx]; numNeighbours += 1.0; }
+  } else { numNeighbours += 1.0; }
+
+  // Bottom
+  if (row > 0u) {
+    let nIdx = (row - 1u) * params.gridCols + col;
+    if (cellType[nIdx] != 2u) { sumP += pressureIn[nIdx]; numNeighbours += 1.0; }
+  } else { numNeighbours += 1.0; }
+
+  // Top
+  if (row < params.gridRows - 1u) {
+    let nIdx = (row + 1u) * params.gridCols + col;
+    if (cellType[nIdx] != 2u) { sumP += pressureIn[nIdx]; numNeighbours += 1.0; }
+  } else { numNeighbours += 1.0; }
+
+  if (numNeighbours > 0.0) {
+    // Jacobi: p = (sumNeighbours - div * h²) / numNeighbours
+    let h = min(params.cellW, params.cellH);
+    pressureOut[idx] = (sumP - div * h * h) / numNeighbours;
+  } else {
+    pressureOut[idx] = 0.0;
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Project: subtract pressure gradient from velocity
+// ─────────────────────────────────────────────────────────────────────────────
+const PROJECT_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params   : Params;
+@group(0) @binding(1) var<storage, read_write> uVel     : array<f32>;
+@group(0) @binding(2) var<storage, read_write> vVel     : array<f32>;
+@group(0) @binding(3) var<storage, read>       pressure : array<f32>;
+@group(0) @binding(4) var<storage, read>       cellType : array<u32>;
+
+@compute @workgroup_size(8, 8)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let col = gid.x;
+  let row = gid.y;
+  if (col >= params.gridCols || row >= params.gridRows) { return; }
+
+  let idx = row * params.gridCols + col;
+  if (cellType[idx] != 1u) { return; }
+
+  let p = pressure[idx];
+  let uCols = params.gridCols + 1u;
+
+  // Subtract pressure gradient from u-velocities (left and right faces)
+  // u[i,j] -= (p[i,j] - p[i-1,j]) / cellW
+  {
+    let uIdx = row * uCols + col;
+    // Left face: only if left cell is not solid
+    if (col > 0u) {
+      let leftType = cellType[idx - 1u];
+      if (leftType != 2u) {
+        let pLeft = pressure[idx - 1u];
+        uVel[uIdx] -= (p - pLeft) / params.cellW;
+      }
+    } else {
+      uVel[uIdx] = 0.0;  // solid boundary
+    }
+  }
+  {
+    // Right face
+    let uIdx = row * uCols + col + 1u;
+    if (col < params.gridCols - 1u) {
+      let rightType = cellType[idx + 1u];
+      if (rightType != 2u) {
+        let pRight = pressure[idx + 1u];
+        uVel[uIdx] -= (pRight - p) / params.cellW;
+      }
+    } else {
+      uVel[uIdx] = 0.0;
+    }
+  }
+
+  // Subtract pressure gradient from v-velocities (bottom and top faces)
+  {
+    let vCols = params.gridCols;
+    let vIdx = row * vCols + col;
+    if (row > 0u) {
+      let bottomType = cellType[(row - 1u) * params.gridCols + col];
+      if (bottomType != 2u) {
+        let pBottom = pressure[(row - 1u) * params.gridCols + col];
+        vVel[vIdx] -= (p - pBottom) / params.cellH;
+      }
+    } else {
+      vVel[vIdx] = 0.0;
+    }
+  }
+  {
+    let vCols = params.gridCols;
+    let vIdx = (row + 1u) * vCols + col;
+    if (row < params.gridRows - 1u) {
+      let topType = cellType[(row + 1u) * params.gridCols + col];
+      if (topType != 2u) {
+        let pTop = pressure[(row + 1u) * params.gridCols + col];
+        vVel[vIdx] -= (pTop - p) / params.cellH;
+      }
+    } else {
+      vVel[vIdx] = 0.0;
+    }
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — G2P: transfer grid velocities back to particles (FLIP/PIC blend)
+// ─────────────────────────────────────────────────────────────────────────────
+const G2P_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params   : Params;
+@group(0) @binding(1) var<storage, read_write> pts      : array<Particle>;
+@group(0) @binding(2) var<storage, read>       uVel     : array<f32>;
+@group(0) @binding(3) var<storage, read>       vVel     : array<f32>;
+@group(0) @binding(4) var<storage, read>       uVelOld  : array<f32>;
+@group(0) @binding(5) var<storage, read>       vVelOld  : array<f32>;
+@group(0) @binding(6) var<storage, read>       cellLinks: array<CellLink>;
+
+fn sampleU(pos : vec2f) -> f32 {
+  let sx = pos.x / params.cellW;
+  let sy = pos.y / params.cellH - 0.5;
+  let i0 = i32(floor(sx));
+  let j0 = i32(floor(sy));
+  let fx = sx - f32(i0);
+  let fy = sy - f32(j0);
+
+  let uCols = i32(params.gridCols) + 1;
+  let uRows = i32(params.gridRows);
+
+  var val = 0.0;
+  for (var di = 0; di <= 1; di++) {
+    for (var dj = 0; dj <= 1; dj++) {
+      let ci = clamp(i0 + di, 0, uCols - 1);
+      let cj = clamp(j0 + dj, 0, uRows - 1);
+      let wx = select(1.0 - fx, fx, di == 1);
+      let wy = select(1.0 - fy, fy, dj == 1);
+      let gIdx = cj * uCols + ci;
+      val += wx * wy * uVel[u32(gIdx)];
+    }
+  }
+  return val;
+}
+
+fn sampleV(pos : vec2f) -> f32 {
+  let sx = pos.x / params.cellW - 0.5;
+  let sy = pos.y / params.cellH;
+  let i0 = i32(floor(sx));
+  let j0 = i32(floor(sy));
+  let fx = sx - f32(i0);
+  let fy = sy - f32(j0);
+
+  let vCols = i32(params.gridCols);
+  let vRows = i32(params.gridRows) + 1;
+
+  var val = 0.0;
+  for (var di = 0; di <= 1; di++) {
+    for (var dj = 0; dj <= 1; dj++) {
+      let ci = clamp(i0 + di, 0, vCols - 1);
+      let cj = clamp(j0 + dj, 0, vRows - 1);
+      let wx = select(1.0 - fx, fx, di == 1);
+      let wy = select(1.0 - fy, fy, dj == 1);
+      let gIdx = cj * vCols + ci;
+      val += wx * wy * vVel[u32(gIdx)];
+    }
+  }
+  return val;
+}
+
+fn sampleUOld(pos : vec2f) -> f32 {
+  let sx = pos.x / params.cellW;
+  let sy = pos.y / params.cellH - 0.5;
+  let i0 = i32(floor(sx));
+  let j0 = i32(floor(sy));
+  let fx = sx - f32(i0);
+  let fy = sy - f32(j0);
+
+  let uCols = i32(params.gridCols) + 1;
+  let uRows = i32(params.gridRows);
+
+  var val = 0.0;
+  for (var di = 0; di <= 1; di++) {
+    for (var dj = 0; dj <= 1; dj++) {
+      let ci = clamp(i0 + di, 0, uCols - 1);
+      let cj = clamp(j0 + dj, 0, uRows - 1);
+      let wx = select(1.0 - fx, fx, di == 1);
+      let wy = select(1.0 - fy, fy, dj == 1);
+      let gIdx = cj * uCols + ci;
+      val += wx * wy * uVelOld[u32(gIdx)];
+    }
+  }
+  return val;
+}
+
+fn sampleVOld(pos : vec2f) -> f32 {
+  let sx = pos.x / params.cellW - 0.5;
+  let sy = pos.y / params.cellH;
+  let i0 = i32(floor(sx));
+  let j0 = i32(floor(sy));
+  let fx = sx - f32(i0);
+  let fy = sy - f32(j0);
+
+  let vCols = i32(params.gridCols);
+  let vRows = i32(params.gridRows) + 1;
+
+  var val = 0.0;
+  for (var di = 0; di <= 1; di++) {
+    for (var dj = 0; dj <= 1; dj++) {
+      let ci = clamp(i0 + di, 0, vCols - 1);
+      let cj = clamp(j0 + dj, 0, vRows - 1);
+      let wx = select(1.0 - fx, fx, di == 1);
+      let wy = select(1.0 - fy, fy, dj == 1);
+      let gIdx = cj * vCols + ci;
+      val += wx * wy * vVelOld[u32(gIdx)];
+    }
+  }
+  return val;
+}
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
+
+  let link = cellLinks[idx];
+  // Cell particles (membrane, flagella, injectors) skip G2P — they have their own forces
+  if (link.ptype == 1u || link.ptype == 2u || link.ptype == 3u) { return; }
+
+  var pt = pts[idx];
+
+  // PIC velocity (directly from grid)
+  let picU = sampleU(pt.pos);
+  let picV = sampleV(pt.pos);
+
+  // FLIP velocity (particle vel + grid delta)
+  let oldU = sampleUOld(pt.pos);
+  let oldV = sampleVOld(pt.pos);
+  let flipU = pt.vel.x + (picU - oldU);
+  let flipV = pt.vel.y + (picV - oldV);
+
+  // Blend PIC and FLIP
+  let r = params.flipRatio;
+  pt.vel.x = r * flipU + (1.0 - r) * picU;
+  pt.vel.y = r * flipV + (1.0 - r) * picV;
+
+  pts[idx] = pt;
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Particle update (cell biology + advection + repulsion)
+//  Includes: membrane constraints, flagella, injectors, food, chemotaxis
+// ─────────────────────────────────────────────────────────────────────────────
+const UPDATE_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>             params : Params;
+@group(0) @binding(1) var<storage, read_write> pts    : array<Particle>;
+@group(0) @binding(2) var<storage, read_write> cellLinks : array<CellLink>;
+@group(0) @binding(3) var<storage, read_write> injectorTimers : array<atomic<u32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
+
+  var pt = pts[idx];
+  let link = cellLinks[idx];
+
+  // ── Absorbed food: gentle centering force ──────────────────────────
+  if (link.ptype == 4u) {
+    var centroid = vec2f(0.0);
+    for (var c = 0u; c < link.cellSize; c++) {
+      centroid += pts[link.cellStart + c].pos;
+    }
+    centroid /= f32(link.cellSize);
+    let toCentroid = centroid - pt.pos;
+    let distCentroid = length(toCentroid);
+    if (distCentroid > params.radius * 2.0) {
+      pt.vel += (toCentroid / distCentroid) * 80.0 * params.dt;
+    } else {
+      pt.vel += toCentroid * 5.0 * params.dt;
+    }
+  }
+
+  // ── Particle-particle repulsion ────────────────────────────────────
+  var nearestInjector = 0xFFFFFFFFu;
+  var nearestInjDist = params.radius * 4.0;
+  var foodDir = vec2f(0.0);
+  let repR = params.radius * 4.0;
+  for (var j = 0u; j < params.count; j++) {
+    if (j == idx) { continue; }
+    if (link.prev != 0xFFFFFFFFu && (j == link.prev || j == link.next)) { continue; }
+    let delta = pt.pos - pts[j].pos;
+    let dist = length(delta);
+    if (dist > 0.001 && dist < repR) {
+      let jLink = cellLinks[j];
+      let skipRepulsion = (link.ptype == 5u && (jLink.ptype == 3u || jLink.ptype == 1u))
+                       || ((link.ptype == 3u || link.ptype == 1u) && jLink.ptype == 5u);
+      if (!skipRepulsion) {
+        let t = 1.0 - dist / repR;
+        pt.vel += normalize(delta) * t * t * params.repulsion * params.dt;
+      }
+    }
+    // Food: track nearest ready injector
+    if (link.ptype == 5u
+        && dist > 0.001 && dist < params.radius * 4.0 && dist < nearestInjDist) {
+      if (cellLinks[j].ptype == 3u) {
+        let timer = atomicLoad(&injectorTimers[j]);
+        let currentTime = u32(params.time * 1000.0);
+        if (currentTime >= timer) {
+          nearestInjDist = dist;
+          nearestInjector = j;
+        }
+      }
+    }
+    // Food gradient for cell particles
+    if ((link.ptype == 1u || link.ptype == 2u || link.ptype == 3u)
+        && cellLinks[j].ptype == 5u
+        && dist > 0.001 && dist < params.cellW * 4.0) {
+      let w = 1.0 / (dist * dist + 100.0);
+      foodDir += (pts[j].pos - pt.pos) / dist * w;
+    }
+  }
+
+  // ── Cell membrane constraints ──────────────────────────────────────
+  if (link.ptype == 1u || link.ptype == 3u) {
+    let pPrev = pts[link.prev].pos;
+    let pNext = pts[link.next].pos;
+
+    let dPrev = pPrev - pt.pos;
+    let distPrev = length(dPrev);
+    if (distPrev > 0.001) {
+      let stretch = (distPrev - link.restDist) / link.restDist;
+      pt.vel += (dPrev / distPrev) * stretch * 2000.0 * params.dt;
+    }
+
+    let dNext = pNext - pt.pos;
+    let distNext = length(dNext);
+    if (distNext > 0.001) {
+      let stretch = (distNext - link.restDist) / link.restDist;
+      pt.vel += (dNext / distNext) * stretch * 2000.0 * params.dt;
+    }
+
+    if (distPrev > 0.001 && distNext > 0.001) {
+      let mid = (pPrev + pNext) * 0.5;
+      let toMid = mid - pt.pos;
+      let toMidLen = length(toMid);
+
+      let toA = dPrev / distPrev;
+      let toC = dNext / distNext;
+      let cosA = clamp(dot(toA, toC), -1.0, 1.0);
+      let angle = acos(cosA);
+      let diff = angle - link.restAngle;
+
+      let halfEdge = link.restDist * 0.5;
+      let idealMidDist = halfEdge / tan(link.restAngle * 0.5);
+
+      if (toMidLen > 0.001) {
+        let error = toMidLen - idealMidDist;
+        var k = 3000.0;
+        if (abs(diff) > 0.5236) { k = 15000.0; }
+        pt.vel += (toMid / toMidLen) * error * k * params.dt;
+      }
+    }
+
+    var centroid = vec2f(0.0);
+    for (var c = 0u; c < link.cellSize; c++) {
+      centroid += pts[link.cellStart + c].pos;
+    }
+    centroid /= f32(link.cellSize);
+    let toOut = pt.pos - centroid;
+    let distC = length(toOut);
+    if (distC > 0.001) {
+      pt.vel += (toOut / distC) * 300.0 * params.dt;
+    }
+  }
+
+  // ── Flagella constraints ───────────────────────────────────────────
+  if (link.ptype == 2u) {
+    let prevPos = pts[link.prev].pos;
+    let dPrev = prevPos - pt.pos;
+    let distPrev = length(dPrev);
+    if (distPrev > 0.001) {
+      let stretch = (distPrev - link.restDist) / link.restDist;
+      pt.vel += (dPrev / distPrev) * stretch * 2000.0 * params.dt;
+    }
+
+    if (link.next != 0xFFFFFFFFu) {
+      let nextPos = pts[link.next].pos;
+      let dNext = nextPos - pt.pos;
+      let distNext = length(dNext);
+      if (distNext > 0.001) {
+        let stretch = (distNext - link.restDist) / link.restDist;
+        pt.vel += (dNext / distNext) * stretch * 2000.0 * params.dt;
+      }
+    }
+
+    var centroid = vec2f(0.0);
+    for (var c = 0u; c < link.cellSize; c++) {
+      centroid += pts[link.cellStart + c].pos;
+    }
+    centroid /= f32(link.cellSize);
+    let toOut = pt.pos - centroid;
+    let distC = length(toOut);
+    let anchorDist = length(prevPos - centroid);
+    if (distC < anchorDist && distC > 0.001) {
+      pt.vel += (toOut / distC) * 800.0 * params.dt;
+    }
+
+    // Wander + chemotaxis
+    let cellSeed = f32(link.cellStart);
+    let wanderDist = params.worldW * 0.33;
+    let wanderPeriod = wanderDist / 80.0;
+    let wanderStep = floor(params.time / wanderPeriod);
+    let h = wanderStep * 127.1 + cellSeed * 311.7;
+    let wanderAngle = fract(sin(h) * 43758.5453) * 6.2832;
+    let wanderDir = vec2f(cos(wanderAngle), sin(wanderAngle));
+    let foodMag = length(foodDir);
+    var moveDir = wanderDir;
+    if (foodMag > 0.001) {
+      moveDir = normalize(foodDir) * min(foodMag * 50.0, 1.0) + wanderDir * 0.3;
+    }
+    let moveDirLen = length(moveDir);
+    if (moveDirLen > 0.001) {
+      moveDir = moveDir / moveDirLen;
+    }
+
+    let outDir2 = normalize(pt.pos - centroid);
+    let alignment = dot(outDir2, moveDir);
+    let sideAmp = 1.0 - alignment * 0.6;
+
+    if (distPrev > 0.001) {
+      let chainDir = dPrev / distPrev;
+      let perp = vec2f(-chainDir.y, chainDir.x);
+
+      let cycle = params.time * 8.0;
+      let t = cycle - floor(cycle / 6.2832) * 6.2832;
+      var beatForce = 0.0;
+      if (t < 3.1416) {
+        beatForce = sin(t) * 1.0;
+      } else {
+        beatForce = sin(t) * 0.3;
+      }
+
+      let phase = f32(link.chainIdx) * 0.8;
+      let amp = 120.0 * (f32(link.chainIdx) + 1.0) / 7.0;
+      pt.vel += perp * sin(cycle - phase) * beatForce * amp * sideAmp * params.dt;
+    }
+
+    pt.vel += moveDir * 30.0 * params.dt;
+  }
+
+  // ── Injector absorption ────────────────────────────────────────────
+  if (link.ptype == 5u && nearestInjector != 0xFFFFFFFFu) {
+    let injPos = pts[nearestInjector].pos;
+    let toInj = injPos - pt.pos;
+    let dist = nearestInjDist;
+    let attractR = params.radius * 4.0;
+    if (dist > 0.001) {
+      let strength = 1.0 - dist / attractR;
+      pt.vel += normalize(toInj) * strength * 600.0 * params.dt;
+    }
+    if (dist < params.radius * 3.5) {
+      let currentTime = u32(params.time * 1000.0);
+      let timer = atomicLoad(&injectorTimers[nearestInjector]);
+      if (currentTime >= timer) {
+        let result = atomicCompareExchangeWeak(&injectorTimers[nearestInjector], timer, currentTime + 5000u);
+        if (result.exchanged) {
+          let injLink = cellLinks[nearestInjector];
+          cellLinks[idx].ptype = 4u;
+          cellLinks[idx].cellStart = injLink.cellStart;
+          cellLinks[idx].cellSize = injLink.cellSize;
+          cellLinks[idx].prev = nearestInjector;
+          cellLinks[idx].next = 0xFFFFFFFFu;
+        }
+      }
+    }
+  }
+
+  // ── Damping ────────────────────────────────────────────────────────
+  pt.vel *= 0.98;
+
+  // Speed clamp
+  let spd = length(pt.vel);
+  let cap = params.worldW * 0.4;
+  if (spd > cap) { pt.vel = pt.vel / spd * cap; }
+
+  // Euler position step
+  pt.pos += pt.vel * params.dt;
+
+  // Boundary push
+  let margin = params.cellW * 2.0;
+  let bF = params.borderForce;
+  if (pt.pos.x < margin)                 { let t = 1.0 - pt.pos.x / margin;                 pt.vel.x += bF * t * t * params.dt; }
+  if (pt.pos.x > params.worldW - margin) { let t = 1.0 - (params.worldW - pt.pos.x) / margin; pt.vel.x -= bF * t * t * params.dt; }
+  if (pt.pos.y < margin)                 { let t = 1.0 - pt.pos.y / margin;                 pt.vel.y += bF * t * t * params.dt; }
+  if (pt.pos.y > params.worldH - margin) { let t = 1.0 - (params.worldH - pt.pos.y) / margin; pt.vel.y -= bF * t * t * params.dt; }
+
+  // Hard clamp
+  pt.pos.x = clamp(pt.pos.x, 0.0, params.worldW);
+  pt.pos.y = clamp(pt.pos.y, 0.0, params.worldH);
+
+  pts[idx] = pt;
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Render (vertex + fragment) — same as original
+// ─────────────────────────────────────────────────────────────────────────────
+const RENDER_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>       params : Params;
+@group(0) @binding(1) var<storage, read> pts    : array<Particle>;
+
+struct VOut {
+  @builtin(position) pos   : vec4f,
+  @location(0)       uv    : vec2f,
+  @location(1)       color : vec4f,
+}
+
+var<private> QUAD : array<vec2f, 6> = array<vec2f, 6>(
+  vec2f(-1.0, -1.0), vec2f( 1.0, -1.0), vec2f(-1.0,  1.0),
+  vec2f(-1.0,  1.0), vec2f( 1.0, -1.0), vec2f( 1.0,  1.0),
+);
+
+@vertex
+fn vs(
+  @builtin(vertex_index)   vi : u32,
+  @builtin(instance_index) ii : u32,
+) -> VOut {
+  let corner   = QUAD[vi];
+  let pt       = pts[ii];
+  let r = params.radius * pt.color.a;
+  let worldPos = pt.pos + corner * r;
+
+  let ndc = vec2f(
+     worldPos.x / params.worldW * 2.0 - 1.0,
+    -worldPos.y / params.worldH * 2.0 + 1.0,
+  );
+
+  var out : VOut;
+  out.pos   = vec4f(ndc, 0.0, 1.0);
+  out.uv    = corner;
+  out.color = pt.color;
+  return out;
+}
+
+@fragment
+fn fs(in : VOut) -> @location(0) vec4f {
+  let d = length(in.uv);
+  if (d > 1.0) { discard; }
+
+  let alpha = 1.0 - smoothstep(0.65, 1.0, d);
+
+  let lightDir  = normalize(vec2f(-1.0, 1.0));
+  let highlight = max(0.0, dot(normalize(in.uv - vec2f(0.4, -0.4)), lightDir)) * 0.35;
+
+  return vec4f(in.color.rgb + highlight, alpha);
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Arrow overlay (visualise MAC grid velocities)
+// ─────────────────────────────────────────────────────────────────────────────
+const ARROW_WGSL = /* wgsl */`
+${WGSL_STRUCTS}
+
+@group(0) @binding(0) var<uniform>       params : Params;
+@group(0) @binding(1) var<storage, read> uVel   : array<f32>;
+@group(0) @binding(2) var<storage, read> vVel   : array<f32>;
+
+struct VOut {
+  @builtin(position) pos   : vec4f,
+  @location(0)       alpha : f32,
+}
+
+@vertex
+fn vs(
+  @builtin(vertex_index)   vi : u32,
+  @builtin(instance_index) ii : u32,
+) -> VOut {
+  let col = ii % params.gridCols;
+  let row = ii / params.gridCols;
+
+  let cx = (f32(col) + 0.5) * params.cellW;
+  let cy = (f32(row) + 0.5) * params.cellH;
+  let center = vec2f(cx, cy);
+
+  // Average u from left/right faces, v from top/bottom faces
+  let uCols = params.gridCols + 1u;
+  let uL = uVel[row * uCols + col];
+  let uR = uVel[row * uCols + col + 1u];
+  let vB = vVel[row * params.gridCols + col];
+  let vT = vVel[(row + 1u) * params.gridCols + col];
+  let fVec = vec2f((uL + uR) * 0.5, (vB + vT) * 0.5);
+  let mag = length(fVec);
+
+  let cellS = min(params.cellW, params.cellH) * 0.4;
+
+  var dir = vec2f(0.0, 0.0);
+  var drawAlpha = 0.0;
+  if (mag > 0.01) {
+    dir = fVec / mag;
+    drawAlpha = clamp(mag * 0.005, 0.25, 0.85);
+  }
+  let perp = vec2f(-dir.y, dir.x);
+
+  let arrowLen = cellS;
+  let tip      = center + dir * arrowLen;
+  let base     = center - dir * arrowLen;
+  let barbLen  = arrowLen * 0.4;
+
+  var worldPos = center;
+  if (vi == 0u) { worldPos = base; }
+  else if (vi == 1u) { worldPos = tip; }
+  else if (vi == 2u) { worldPos = tip; }
+  else if (vi == 3u) { worldPos = tip - dir * barbLen + perp * barbLen; }
+  else if (vi == 4u) { worldPos = tip; }
+  else if (vi == 5u) { worldPos = tip - dir * barbLen - perp * barbLen; }
+
+  let ndc = vec2f(
+     worldPos.x / params.worldW * 2.0 - 1.0,
+    -worldPos.y / params.worldH * 2.0 + 1.0,
+  );
+
+  var out : VOut;
+  out.pos   = vec4f(ndc, 0.0, 1.0);
+  out.alpha = f32(drawAlpha);
+  return out;
+}
+
+@fragment
+fn fs(in : VOut) -> @location(0) vec4f {
+  if (in.alpha < 0.01) { discard; }
+  return vec4f(0.45, 0.65, 1.0, in.alpha);
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WebGPU initialisation
+// ─────────────────────────────────────────────────────────────────────────────
+async function initGPU() {
+  if (!navigator.gpu) {
+    throw new Error('WebGPU is not supported in this browser.');
+  }
+  const adapter = await navigator.gpu.requestAdapter();
+  if (!adapter) throw new Error('No WebGPU adapter found.');
+
+  device = await adapter.requestDevice();
+  device.lost.then(info => {
+    setStatus(`GPU device lost: ${info.message}. Please refresh.`);
+  });
+
+  canvasFormat = navigator.gpu.getPreferredCanvasFormat();
+  context = canvas.getContext('webgpu');
+  reconfigureContext();
+}
+
+function reconfigureContext() {
+  context.configure({ device, format: canvasFormat, alphaMode: 'opaque' });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Buffer creation
+// ─────────────────────────────────────────────────────────────────────────────
+function createBuffers() {
+  particleBuf = device.createBuffer({
+    label: 'particles',
+    size:  MAX_PARTICLES * PARTICLE_BYTES,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  cellLinkBuf = device.createBuffer({
+    label: 'cellLinks',
+    size:  MAX_PARTICLES * CELL_LINK_BYTES,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  injectorTimerBuf = device.createBuffer({
+    label: 'injectorTimers',
+    size:  MAX_PARTICLES * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  // MAC grid buffers — allocate max sizes
+  const maxU = (MAX_GRID_DIM + 1) * MAX_GRID_DIM;
+  const maxV = MAX_GRID_DIM * (MAX_GRID_DIM + 1);
+  const maxC = MAX_GRID_DIM * MAX_GRID_DIM;
+
+  uVelBuf = device.createBuffer({
+    label: 'uVel', size: maxU * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  vVelBuf = device.createBuffer({
+    label: 'vVel', size: maxV * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  uVelOldBuf = device.createBuffer({
+    label: 'uVelOld', size: maxU * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  vVelOldBuf = device.createBuffer({
+    label: 'vVelOld', size: maxV * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  uAccumBuf = device.createBuffer({
+    label: 'uAccum', size: maxU * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  vAccumBuf = device.createBuffer({
+    label: 'vAccum', size: maxV * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  uWAccumBuf = device.createBuffer({
+    label: 'uWAccum', size: maxU * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  vWAccumBuf = device.createBuffer({
+    label: 'vWAccum', size: maxV * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  pressureBuf = device.createBuffer({
+    label: 'pressure', size: maxC * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  pressureTempBuf = device.createBuffer({
+    label: 'pressureTemp', size: maxC * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  divergenceBuf = device.createBuffer({
+    label: 'divergence', size: maxC * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+  cellTypeBuf = device.createBuffer({
+    label: 'cellType', size: maxC * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  uniformBuf = device.createBuffer({
+    label: 'uniforms',
+    size:  UNIFORM_BYTES,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  // Init cell links to sentinel
+  const sentinel = new Uint8Array(MAX_PARTICLES * CELL_LINK_BYTES);
+  sentinel.fill(0xFF);
+  device.queue.writeBuffer(cellLinkBuf, 0, sentinel);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Pipeline creation
+// ─────────────────────────────────────────────────────────────────────────────
+function createPipelines() {
+  const mk = (code) => device.createShaderModule({ code });
+
+  clearGridPipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(CLEAR_GRID_WGSL), entryPoint: 'main' },
+  });
+
+  p2gPipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(P2G_WGSL), entryPoint: 'main' },
+  });
+
+  normalisePipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(NORMALISE_WGSL), entryPoint: 'main' },
+  });
+
+  markCellsPipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(MARK_CELLS_WGSL), entryPoint: 'main' },
+  });
+
+  addGravityPipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(ADD_GRAVITY_WGSL), entryPoint: 'main' },
+  });
+
+  solvePressurePipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(SOLVE_PRESSURE_WGSL), entryPoint: 'main' },
+  });
+
+  projectPipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(PROJECT_WGSL), entryPoint: 'main' },
+  });
+
+  g2pPipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(G2P_WGSL), entryPoint: 'main' },
+  });
+
+  updatePipeline = device.createComputePipeline({
+    layout: 'auto', compute: { module: mk(UPDATE_WGSL), entryPoint: 'main' },
+  });
+
+  const renderMod = mk(RENDER_WGSL);
+  renderPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex:   { module: renderMod, entryPoint: 'vs' },
+    fragment: {
+      module: renderMod, entryPoint: 'fs',
+      targets: [{
+        format: canvasFormat,
+        blend: {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        },
+      }],
+    },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  const arrowMod = mk(ARROW_WGSL);
+  arrowPipeline = device.createRenderPipeline({
+    layout: 'auto',
+    vertex:   { module: arrowMod, entryPoint: 'vs' },
+    fragment: {
+      module: arrowMod, entryPoint: 'fs',
+      targets: [{
+        format: canvasFormat,
+        blend: {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          alpha: { srcFactor: 'one', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        },
+      }],
+    },
+    primitive: { topology: 'line-list' },
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Bind-group creation
+// ─────────────────────────────────────────────────────────────────────────────
+function createBindGroups() {
+  clearGridBG = device.createBindGroup({
+    layout: clearGridPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf    } },
+      { binding: 1, resource: { buffer: uAccumBuf     } },
+      { binding: 2, resource: { buffer: vAccumBuf     } },
+      { binding: 3, resource: { buffer: uWAccumBuf    } },
+      { binding: 4, resource: { buffer: vWAccumBuf    } },
+      { binding: 5, resource: { buffer: pressureBuf   } },
+      { binding: 6, resource: { buffer: divergenceBuf } },
+      { binding: 7, resource: { buffer: cellTypeBuf   } },
+    ],
+  });
+
+  p2gBG = device.createBindGroup({
+    layout: p2gPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf   } },
+      { binding: 1, resource: { buffer: particleBuf  } },
+      { binding: 2, resource: { buffer: uAccumBuf    } },
+      { binding: 3, resource: { buffer: vAccumBuf    } },
+      { binding: 4, resource: { buffer: uWAccumBuf   } },
+      { binding: 5, resource: { buffer: vWAccumBuf   } },
+      { binding: 6, resource: { buffer: cellLinkBuf  } },
+    ],
+  });
+
+  normaliseBG = device.createBindGroup({
+    layout: normalisePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf   } },
+      { binding: 1, resource: { buffer: uVelBuf      } },
+      { binding: 2, resource: { buffer: vVelBuf      } },
+      { binding: 3, resource: { buffer: uAccumBuf    } },
+      { binding: 4, resource: { buffer: vAccumBuf    } },
+      { binding: 5, resource: { buffer: uWAccumBuf   } },
+      { binding: 6, resource: { buffer: vWAccumBuf   } },
+      { binding: 7, resource: { buffer: uVelOldBuf   } },
+      { binding: 8, resource: { buffer: vVelOldBuf   } },
+    ],
+  });
+
+  markCellsBG = device.createBindGroup({
+    layout: markCellsPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf  } },
+      { binding: 1, resource: { buffer: particleBuf } },
+      { binding: 2, resource: { buffer: cellTypeBuf } },
+    ],
+  });
+
+  addGravityBG = device.createBindGroup({
+    layout: addGravityPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf  } },
+      { binding: 1, resource: { buffer: uVelBuf     } },
+      { binding: 2, resource: { buffer: vVelBuf     } },
+      { binding: 3, resource: { buffer: cellTypeBuf } },
+    ],
+  });
+
+  // Pressure solve ping-pong: A reads pressure -> writes pressureTemp
+  solvePressureBG_A = device.createBindGroup({
+    layout: solvePressurePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf      } },
+      { binding: 1, resource: { buffer: uVelBuf         } },
+      { binding: 2, resource: { buffer: vVelBuf         } },
+      { binding: 3, resource: { buffer: cellTypeBuf     } },
+      { binding: 4, resource: { buffer: pressureBuf     } },
+      { binding: 5, resource: { buffer: pressureTempBuf } },
+      { binding: 6, resource: { buffer: divergenceBuf   } },
+    ],
+  });
+  // B reads pressureTemp -> writes pressure
+  solvePressureBG_B = device.createBindGroup({
+    layout: solvePressurePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf      } },
+      { binding: 1, resource: { buffer: uVelBuf         } },
+      { binding: 2, resource: { buffer: vVelBuf         } },
+      { binding: 3, resource: { buffer: cellTypeBuf     } },
+      { binding: 4, resource: { buffer: pressureTempBuf } },
+      { binding: 5, resource: { buffer: pressureBuf     } },
+      { binding: 6, resource: { buffer: divergenceBuf   } },
+    ],
+  });
+
+  projectBG = device.createBindGroup({
+    layout: projectPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf  } },
+      { binding: 1, resource: { buffer: uVelBuf     } },
+      { binding: 2, resource: { buffer: vVelBuf     } },
+      { binding: 3, resource: { buffer: pressureBuf } },
+      { binding: 4, resource: { buffer: cellTypeBuf } },
+    ],
+  });
+
+  g2pBG = device.createBindGroup({
+    layout: g2pPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf   } },
+      { binding: 1, resource: { buffer: particleBuf  } },
+      { binding: 2, resource: { buffer: uVelBuf      } },
+      { binding: 3, resource: { buffer: vVelBuf      } },
+      { binding: 4, resource: { buffer: uVelOldBuf   } },
+      { binding: 5, resource: { buffer: vVelOldBuf   } },
+      { binding: 6, resource: { buffer: cellLinkBuf  } },
+    ],
+  });
+
+  updateBG = device.createBindGroup({
+    layout: updatePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf       } },
+      { binding: 1, resource: { buffer: particleBuf      } },
+      { binding: 2, resource: { buffer: cellLinkBuf      } },
+      { binding: 3, resource: { buffer: injectorTimerBuf } },
+    ],
+  });
+
+  renderBG = device.createBindGroup({
+    layout: renderPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf  } },
+      { binding: 1, resource: { buffer: particleBuf } },
+    ],
+  });
+
+  arrowBG = device.createBindGroup({
+    layout: arrowPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: uVelBuf    } },
+      { binding: 2, resource: { buffer: vVelBuf    } },
+    ],
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Uniform upload
+// ─────────────────────────────────────────────────────────────────────────────
+const _uniformAB = new ArrayBuffer(UNIFORM_BYTES);
+const _uniformDV = new DataView(_uniformAB);
+
+function uploadUniforms(dt) {
+  const cellW = sim.worldWidth  / sim.gridCols;
+  const cellH = sim.worldHeight / sim.gridRows;
+
+  _uniformDV.setFloat32( 0, sim.worldWidth,    true);   // worldW
+  _uniformDV.setFloat32( 4, sim.worldHeight,   true);   // worldH
+  _uniformDV.setUint32 ( 8, sim.gridCols,      true);   // gridCols
+  _uniformDV.setUint32 (12, sim.gridRows,      true);   // gridRows
+  _uniformDV.setFloat32(16, cellW,             true);   // cellW
+  _uniformDV.setFloat32(20, cellH,             true);   // cellH
+  _uniformDV.setUint32 (24, particleCount,     true);   // count
+  _uniformDV.setFloat32(28, dt,                true);   // dt
+  _uniformDV.setFloat32(32, sim.particleRadius,true);   // radius
+  _uniformDV.setFloat32(36, sim.repulsion,     true);   // repulsion
+  _uniformDV.setFloat32(40, sim.borderForce,   true);   // borderForce
+  simTime += dt;
+  _uniformDV.setFloat32(44, simTime,           true);   // time
+  _uniformDV.setFloat32(48, sim.gravity,       true);   // gravity
+  _uniformDV.setFloat32(52, sim.flipRatio,     true);   // flipRatio
+  _uniformDV.setFloat32(56, 0,                 true);   // pad0
+  _uniformDV.setFloat32(60, 0,                 true);   // pad1
+  device.queue.writeBuffer(uniformBuf, 0, _uniformAB);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Particle helpers
+// ─────────────────────────────────────────────────────────────────────────────
+function hsvToRgb(h, s, v) {
+  const i = Math.floor(h * 6);
+  const f = h * 6 - i;
+  const p = v * (1 - s);
+  const q = v * (1 - f * s);
+  const t = v * (1 - (1 - f) * s);
+  switch (i % 6) {
+    case 0: return [v, t, p];
+    case 1: return [q, v, p];
+    case 2: return [p, v, t];
+    case 3: return [p, q, v];
+    case 4: return [t, p, v];
+    case 5: return [v, p, q];
+  }
+  return [0, 0, 0];
+}
+
+function addParticles(n) {
+  const toAdd = Math.min(n, MAX_PARTICLES - particleCount);
+  if (toAdd <= 0) {
+    setStatus(`Maximum of ${MAX_PARTICLES} particles reached.`);
+    return;
+  }
+
+  const foodFraction = 0.1;
+  const foodCount = Math.floor(toAdd * foodFraction);
+
+  const f32 = new Float32Array(toAdd * 8);
+  for (let i = 0; i < toAdd; i++) {
+    const b = i * 8;
+    f32[b + 0] = Math.random() * sim.worldWidth;
+    f32[b + 1] = Math.random() * sim.worldHeight;
+    f32[b + 2] = 0;
+    f32[b + 3] = 0;
+    if (i < foodCount) {
+      f32[b + 4] = 0.2;   // green food
+      f32[b + 5] = 0.9;
+      f32[b + 6] = 0.2;
+    } else {
+      const [r, g, bl] = hsvToRgb(0.58 + Math.random() * 0.08, 0.7, 0.9);
+      f32[b + 4] = r;
+      f32[b + 5] = g;
+      f32[b + 6] = bl;
+    }
+    f32[b + 7] = 1;
+  }
+
+  device.queue.writeBuffer(particleBuf, particleCount * PARTICLE_BYTES, f32.buffer);
+
+  const linkAB = new ArrayBuffer(toAdd * CELL_LINK_BYTES);
+  const linkBytes = new Uint8Array(linkAB);
+  linkBytes.fill(0xFF);
+  const linkDV = new DataView(linkAB);
+  for (let i = 0; i < foodCount; i++) {
+    linkDV.setUint32(i * CELL_LINK_BYTES + 28, 5, true);  // ptype = 5 (food)
+  }
+  device.queue.writeBuffer(cellLinkBuf, particleCount * CELL_LINK_BYTES, linkAB);
+
+  particleCount += toAdd;
+  setStatus(`Particles: ${particleCount}`);
+}
+
+function addCell(cx, cy) {
+  const N  = MEMBRANE_SIZE;
+  const FL = FLAGELLA_LENGTH;
+  const FC = FLAGELLA_COUNT;
+  const totalParts = N + FC * FL;
+
+  const memRestDist = sim.particleRadius * 2;
+  const R = memRestDist / (2 * Math.sin(Math.PI / N));
+
+  if (particleCount + totalParts > MAX_PARTICLES) {
+    setStatus(`Need ${totalParts} free slots (have ${MAX_PARTICLES - particleCount}).`);
+    return;
+  }
+
+  const baseIdx = particleCount;
+
+  // Membrane particles
+  const flagSpacing = Math.floor(N / FC);
+  const anchorIndices = new Set();
+  for (let f = 0; f < FC; f++) {
+    anchorIndices.add(f * flagSpacing);
+  }
+  const injSpacing = Math.floor(N / INJECTOR_COUNT);
+  const injectorIndices = new Set();
+  for (let ii = 0; ii < INJECTOR_COUNT; ii++) {
+    injectorIndices.add(ii * injSpacing + 2);
+  }
+
+  const memF32 = new Float32Array(N * 8);
+  for (let i = 0; i < N; i++) {
+    const angle = (i / N) * 2 * Math.PI;
+    const b = i * 8;
+    memF32[b + 0] = cx + R * Math.cos(angle);
+    memF32[b + 1] = cy + R * Math.sin(angle);
+    memF32[b + 2] = 0;
+    memF32[b + 3] = 0;
+    if (anchorIndices.has(i)) {
+      memF32[b + 4] = 1.0;
+      memF32[b + 5] = 0.55;
+      memF32[b + 6] = 0.1;
+    } else if (injectorIndices.has(i)) {
+      memF32[b + 4] = 1.0;
+      memF32[b + 5] = 0.1;
+      memF32[b + 6] = 0.1;
+    } else {
+      memF32[b + 4] = 0.15;
+      memF32[b + 5] = 0.85;
+      memF32[b + 6] = 0.35;
+    }
+    memF32[b + 7] = 1.0;
+  }
+  device.queue.writeBuffer(particleBuf, baseIdx * PARTICLE_BYTES, memF32.buffer);
+
+  // Membrane cell-link data
+  const restAngle = Math.PI * (N - 2) / N;
+  const memLinkAB = new ArrayBuffer(N * CELL_LINK_BYTES);
+  const memLinkDV = new DataView(memLinkAB);
+  for (let i = 0; i < N; i++) {
+    const off = i * CELL_LINK_BYTES;
+    memLinkDV.setUint32 (off + 0,  baseIdx + ((i - 1 + N) % N), true);
+    memLinkDV.setUint32 (off + 4,  baseIdx + ((i + 1)     % N), true);
+    memLinkDV.setFloat32(off + 8,  memRestDist,  true);
+    memLinkDV.setFloat32(off + 12, restAngle, true);
+    memLinkDV.setUint32 (off + 16, baseIdx, true);
+    memLinkDV.setUint32 (off + 20, N, true);
+    memLinkDV.setUint32 (off + 24, 0, true);
+    memLinkDV.setUint32 (off + 28, injectorIndices.has(i) ? 3 : 1, true);
+  }
+  device.queue.writeBuffer(cellLinkBuf, baseIdx * CELL_LINK_BYTES, memLinkAB);
+
+  // Flagella particles + links
+  const flagParticles = new Float32Array(FC * FL * 8);
+  const flagLinkAB    = new ArrayBuffer(FC * FL * CELL_LINK_BYTES);
+  const flagLinkDV    = new DataView(flagLinkAB);
+  const flagRestDist  = sim.particleRadius;
+  const rootDist      = sim.particleRadius * 1.5;
+
+  for (let f = 0; f < FC; f++) {
+    const memI  = f * flagSpacing;
+    const angle = (memI / N) * 2 * Math.PI;
+    const dirX  = Math.cos(angle);
+    const dirY  = Math.sin(angle);
+
+    for (let j = 0; j < FL; j++) {
+      const gi = f * FL + j;
+      const globalIdx = baseIdx + N + gi;
+
+      const dist = rootDist + j * flagRestDist;
+      const b = gi * 8;
+      flagParticles[b + 0] = cx + (R + dist) * dirX;
+      flagParticles[b + 1] = cy + (R + dist) * dirY;
+      flagParticles[b + 2] = 0;
+      flagParticles[b + 3] = 0;
+      flagParticles[b + 4] = 1.0;
+      flagParticles[b + 5] = 0.55;
+      flagParticles[b + 6] = 0.1;
+      flagParticles[b + 7] = 0.5;
+
+      const off = gi * CELL_LINK_BYTES;
+      const prevIdx = (j === 0) ? (baseIdx + memI) : (globalIdx - 1);
+      const nextIdx = (j === FL - 1) ? 0xFFFFFFFF : (globalIdx + 1);
+      const rd = (j === 0) ? rootDist : flagRestDist;
+
+      flagLinkDV.setUint32 (off + 0,  prevIdx, true);
+      flagLinkDV.setUint32 (off + 4,  nextIdx, true);
+      flagLinkDV.setFloat32(off + 8,  rd, true);
+      flagLinkDV.setFloat32(off + 12, 0, true);
+      flagLinkDV.setUint32 (off + 16, baseIdx, true);
+      flagLinkDV.setUint32 (off + 20, N, true);
+      flagLinkDV.setUint32 (off + 24, j, true);
+      flagLinkDV.setUint32 (off + 28, 2, true);
+    }
+  }
+  device.queue.writeBuffer(particleBuf,  (baseIdx + N) * PARTICLE_BYTES,  flagParticles.buffer);
+  device.queue.writeBuffer(cellLinkBuf,  (baseIdx + N) * CELL_LINK_BYTES, flagLinkAB);
+
+  particleCount += totalParts;
+  setStatus(`Cell added! Particles: ${particleCount}`);
+}
+
+function resetSim() {
+  particleCount = 0;
+  simTime = 0;
+  device.queue.writeBuffer(particleBuf, 0, new Uint8Array(MAX_PARTICLES * PARTICLE_BYTES));
+  const s = new Uint8Array(MAX_PARTICLES * CELL_LINK_BYTES);
+  s.fill(0xFF);
+  device.queue.writeBuffer(cellLinkBuf, 0, s);
+  device.queue.writeBuffer(injectorTimerBuf, 0, new Uint8Array(MAX_PARTICLES * 4));
+
+  // Clear grid buffers
+  const maxU = (MAX_GRID_DIM + 1) * MAX_GRID_DIM * 4;
+  const maxV = MAX_GRID_DIM * (MAX_GRID_DIM + 1) * 4;
+  const maxC = MAX_GRID_DIM * MAX_GRID_DIM * 4;
+  device.queue.writeBuffer(uVelBuf,      0, new Uint8Array(maxU));
+  device.queue.writeBuffer(vVelBuf,      0, new Uint8Array(maxV));
+  device.queue.writeBuffer(uVelOldBuf,   0, new Uint8Array(maxU));
+  device.queue.writeBuffer(vVelOldBuf,   0, new Uint8Array(maxV));
+  device.queue.writeBuffer(uAccumBuf,    0, new Uint8Array(maxU));
+  device.queue.writeBuffer(vAccumBuf,    0, new Uint8Array(maxV));
+  device.queue.writeBuffer(uWAccumBuf,   0, new Uint8Array(maxU));
+  device.queue.writeBuffer(vWAccumBuf,   0, new Uint8Array(maxV));
+  device.queue.writeBuffer(pressureBuf,  0, new Uint8Array(maxC));
+  device.queue.writeBuffer(pressureTempBuf, 0, new Uint8Array(maxC));
+  device.queue.writeBuffer(divergenceBuf,0, new Uint8Array(maxC));
+  device.queue.writeBuffer(cellTypeBuf,  0, new Uint8Array(maxC));
+
+  setStatus('Simulation reset.');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Render loop
+// ─────────────────────────────────────────────────────────────────────────────
+let fpsFrames = 0, fpsAccum = 0;
+
+function frame(ts) {
+  const dt = lastTs === 0 ? 1 / 60 : Math.min((ts - lastTs) / 1000, 1 / 20);
+  lastTs = ts;
+
+  fpsFrames++;
+  fpsAccum += dt;
+  if (fpsAccum >= 1.0) {
+    fpsEl.textContent = `${Math.round(fpsFrames / fpsAccum)} fps`;
+    fpsFrames = 0;
+    fpsAccum  = 0;
+  }
+
+  uploadUniforms(dt);
+
+  const enc = device.createCommandEncoder();
+
+  if (particleCount > 0) {
+    const maxGridElements = Math.max(uCount(), vCount(), cellCount());
+    const gridWG = Math.ceil(maxGridElements / 64);
+    const particleWG = Math.ceil(particleCount / 64);
+
+    // ── Pass 1: Clear grid ─────────────────────────────────────────────
+    {
+      const pass = enc.beginComputePass({ label: 'clearGrid' });
+      pass.setPipeline(clearGridPipeline);
+      pass.setBindGroup(0, clearGridBG);
+      pass.dispatchWorkgroups(gridWG);
+      pass.end();
+    }
+
+    // ── Pass 2: P2G — scatter particle velocities to grid ──────────────
+    {
+      const pass = enc.beginComputePass({ label: 'p2g' });
+      pass.setPipeline(p2gPipeline);
+      pass.setBindGroup(0, p2gBG);
+      pass.dispatchWorkgroups(particleWG);
+      pass.end();
+    }
+
+    // ── Pass 3: Normalise grid velocities, save old velocities ─────────
+    {
+      const pass = enc.beginComputePass({ label: 'normalise' });
+      pass.setPipeline(normalisePipeline);
+      pass.setBindGroup(0, normaliseBG);
+      pass.dispatchWorkgroups(gridWG);
+      pass.end();
+    }
+
+    // ── Pass 3b: Mark fluid cells ──────────────────────────────────────
+    {
+      const pass = enc.beginComputePass({ label: 'markCells' });
+      pass.setPipeline(markCellsPipeline);
+      pass.setBindGroup(0, markCellsBG);
+      pass.dispatchWorkgroups(particleWG);
+      pass.end();
+    }
+
+    // ── Pass 4: Add gravity + boundary conditions ──────────────────────
+    {
+      const pass = enc.beginComputePass({ label: 'addGravity' });
+      pass.setPipeline(addGravityPipeline);
+      pass.setBindGroup(0, addGravityBG);
+      pass.dispatchWorkgroups(gridWG);
+      pass.end();
+    }
+
+    // ── Pass 5: Pressure solve (Jacobi iterations, ping-pong) ──────────
+    for (let i = 0; i < JACOBI_ITERS; i++) {
+      const pass = enc.beginComputePass({ label: `pressureSolve_${i}` });
+      pass.setPipeline(solvePressurePipeline);
+      pass.setBindGroup(0, (i % 2 === 0) ? solvePressureBG_A : solvePressureBG_B);
+      pass.dispatchWorkgroups(
+        Math.ceil(sim.gridCols / 8),
+        Math.ceil(sim.gridRows / 8),
+      );
+      pass.end();
+    }
+
+    // If odd number of iterations, final result is in pressureTempBuf
+    // and we need to copy it back. With even iterations, result is in pressureBuf.
+    // Since JACOBI_ITERS=40 is even, result is already in pressureBuf. Good.
+
+    // ── Pass 6: Project — subtract pressure gradient ───────────────────
+    {
+      const pass = enc.beginComputePass({ label: 'project' });
+      pass.setPipeline(projectPipeline);
+      pass.setBindGroup(0, projectBG);
+      pass.dispatchWorkgroups(
+        Math.ceil(sim.gridCols / 8),
+        Math.ceil(sim.gridRows / 8),
+      );
+      pass.end();
+    }
+
+    // ── Pass 7: G2P — transfer grid velocities back to particles ───────
+    {
+      const pass = enc.beginComputePass({ label: 'g2p' });
+      pass.setPipeline(g2pPipeline);
+      pass.setBindGroup(0, g2pBG);
+      pass.dispatchWorkgroups(particleWG);
+      pass.end();
+    }
+
+    // ── Pass 8: Particle update (biology + advection + repulsion) ──────
+    {
+      const pass = enc.beginComputePass({ label: 'update' });
+      pass.setPipeline(updatePipeline);
+      pass.setBindGroup(0, updateBG);
+      pass.dispatchWorkgroups(particleWG);
+      pass.end();
+    }
+  }
+
+  // ── Render pass ────────────────────────────────────────────────────────
+  const renderPass = enc.beginRenderPass({
+    colorAttachments: [{
+      view:       context.getCurrentTexture().createView(),
+      clearValue: { r: 0.04, g: 0.04, b: 0.10, a: 1.0 },
+      loadOp:     'clear',
+      storeOp:    'store',
+    }],
+  });
+
+  if (particleCount > 0) {
+    renderPass.setPipeline(renderPipeline);
+    renderPass.setBindGroup(0, renderBG);
+    renderPass.draw(6, particleCount);
+  }
+
+  if (showVectorField) {
+    renderPass.setPipeline(arrowPipeline);
+    renderPass.setBindGroup(0, arrowBG);
+    renderPass.draw(6, sim.gridCols * sim.gridRows);
+  }
+
+  renderPass.end();
+  device.queue.submit([enc.finish()]);
+
+  rafId = requestAnimationFrame(frame);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Canvas resize
+// ─────────────────────────────────────────────────────────────────────────────
+function resizeCanvas() {
+  const wrap = document.getElementById('canvas-wrap');
+  canvas.width  = wrap.clientWidth;
+  canvas.height = wrap.clientHeight;
+  if (device && context) reconfigureContext();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  UI wiring
+// ─────────────────────────────────────────────────────────────────────────────
+function wireUI() {
+  document.getElementById('addBtn').addEventListener('click', () => {
+    const n = parseInt(numInput.value, 10);
+    if (n > 0) addParticles(n);
+  });
+
+  document.getElementById('resetBtn').addEventListener('click', resetSim);
+
+  worldWInput.addEventListener('change', () => {
+    sim.worldWidth = Math.max(100, parseInt(worldWInput.value, 10) || 1920);
+  });
+  worldHInput.addEventListener('change', () => {
+    sim.worldHeight = Math.max(100, parseInt(worldHInput.value, 10) || 1080);
+  });
+
+  gridColsIn.addEventListener('change', () => {
+    sim.gridCols = Math.min(MAX_GRID_DIM, Math.max(4, parseInt(gridColsIn.value, 10) || 64));
+  });
+  gridRowsIn.addEventListener('change', () => {
+    sim.gridRows = Math.min(MAX_GRID_DIM, Math.max(4, parseInt(gridRowsIn.value, 10) || 36));
+  });
+
+  gravitySl.addEventListener('input', () => {
+    sim.gravity = parseInt(gravitySl.value, 10);
+    gravityBdg.textContent = gravitySl.value;
+  });
+
+  flipSl.addEventListener('input', () => {
+    sim.flipRatio = parseInt(flipSl.value, 10) / 100.0;
+    flipBdg.textContent = sim.flipRatio.toFixed(2);
+  });
+
+  repulsionSl.addEventListener('input', () => {
+    sim.repulsion = parseInt(repulsionSl.value, 10);
+    repulsionBdg.textContent = repulsionSl.value;
+  });
+
+  borderSl.addEventListener('input', () => {
+    sim.borderForce = parseInt(borderSl.value, 10);
+    borderBdg.textContent = borderSl.value;
+  });
+
+  vfOverlayCb.addEventListener('change', () => {
+    showVectorField = vfOverlayCb.checked;
+  });
+
+  cellBtn.addEventListener('click', () => {
+    placingCell = !placingCell;
+    cellBtn.style.background = placingCell ? '#44aa77' : '#225544';
+    canvas.style.cursor = placingCell ? 'crosshair' : '';
+  });
+
+  canvas.addEventListener('click', (e) => {
+    if (!placingCell) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = e.clientX - rect.left;
+    const py = e.clientY - rect.top;
+    const worldX = (px / rect.width)  * sim.worldWidth;
+    const worldY = (py / rect.height) * sim.worldHeight;
+    addCell(worldX, worldY);
+    placingCell = false;
+    cellBtn.style.background = '#225544';
+    canvas.style.cursor = '';
+  });
+}
+
+function setStatus(msg) {
+  statusEl.textContent = msg;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  Entry point
+// ─────────────────────────────────────────────────────────────────────────────
+(async () => {
+  resizeCanvas();
+  window.addEventListener('resize', resizeCanvas);
+  wireUI();
+
+  try {
+    await initGPU();
+    createBuffers();
+    createPipelines();
+    createBindGroups();
+
+    addParticles(4000);
+    setStatus(`FLIP Cell Sim — Particles: ${particleCount}`);
+
+    rafId = requestAnimationFrame(frame);
+  } catch (err) {
+    setStatus(`Error: ${err.message}`);
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>
