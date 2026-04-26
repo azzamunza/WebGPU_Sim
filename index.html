@@ -173,15 +173,36 @@
   <!-- Repulsion slider -->
   <div class="ctrl-group">
     <label for="repulsionSlider">Repulsion:</label>
-    <input type="range" id="repulsionSlider" min="0" max="2000" value="500" step="10">
-    <span class="val-badge" id="repulsionBadge">500</span>
+    <input type="range" id="repulsionSlider" min="0" max="5000" value="1000" step="10">
+    <span class="val-badge" id="repulsionBadge">1000</span>
   </div>
 
-  <!-- Border force slider -->
+  <!-- Restitution slider (collision bounce) -->
   <div class="ctrl-group">
-    <label for="borderSlider">Border push:</label>
-    <input type="range" id="borderSlider" min="0" max="2000" value="200" step="10">
-    <span class="val-badge" id="borderBadge">200</span>
+    <label for="restitutionSlider">Restitution:</label>
+    <input type="range" id="restitutionSlider" min="0" max="1" value="0.5" step="0.05">
+    <span class="val-badge" id="restitutionBadge">0.5</span>
+  </div>
+
+  <!-- Viscosity slider -->
+  <div class="ctrl-group">
+    <label for="viscositySlider">Viscosity:</label>
+    <input type="range" id="viscositySlider" min="0" max="0.1" value="0.01" step="0.001">
+    <span class="val-badge" id="viscosityBadge">0.01</span>
+  </div>
+
+  <!-- Density stiffness slider (SPH pressure) -->
+  <div class="ctrl-group">
+    <label for="densityStiffnessSlider">Density stiffness:</label>
+    <input type="range" id="densityStiffnessSlider" min="0" max="1000" value="100" step="10">
+    <span class="val-badge" id="densityStiffnessBadge">100</span>
+  </div>
+
+  <!-- Gravity slider -->
+  <div class="ctrl-group">
+    <label for="gravitySlider">Gravity:</label>
+    <input type="range" id="gravitySlider" min="-1000" max="1000" value="0" step="10">
+    <span class="val-badge" id="gravityBadge">0</span>
   </div>
 
   <!-- Vector field overlay toggle -->
@@ -214,12 +235,13 @@
 const MAX_PARTICLES  = 50_000;
 const MAX_GRID_DIM   = 256;          // max grid dimension per axis
 const PARTICLE_BYTES = 32;           // vec2f pos + vec2f vel + vec4f color
-const UNIFORM_BYTES  = 48;           // 12 × 4-byte words (padded to 16-byte multiples)
-const CELL_LINK_BYTES = 32;          // prev(u32) + next(u32) + restDist(f32) + restAngle(f32) + cellStart(u32) + cellSize(u32) + pad(8)
-const MEMBRANE_SIZE   = 40;          // particles per cell membrane
-const FLAGELLA_COUNT  = 8;           // flagella per cell (evenly spaced)
-const FLAGELLA_LENGTH = 7;           // particles per flagellum
-const INJECTOR_COUNT  = 4;           // injector particles per cell (red, absorb liquid)
+const UNIFORM_BYTES  = 64;           // Params struct with physics parameters
+const HASH_ENTRY_BYTES = 8;          // u32 hash + u32 index
+
+// Spatial hashing parameters
+const SMOOTHING_RADIUS = 40.0;       // h for SPH kernel
+const GRID_CELL_SIZE = SMOOTHING_RADIUS;
+const MAX_NEIGHBORS_PER_CELL = 64;   // For safe lookup bounds
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  DOM refs
@@ -230,16 +252,16 @@ const fpsEl       = document.getElementById('fps');
 const numInput    = document.getElementById('numInput');
 const worldWInput = document.getElementById('worldW');
 const worldHInput = document.getElementById('worldH');
-const falloffSl   = document.getElementById('falloffSlider');
-const falloffBdg  = document.getElementById('falloffBadge');
-const gridColsIn  = document.getElementById('gridCols');
-const gridRowsIn  = document.getElementById('gridRows');
-const forceSl     = document.getElementById('forceSlider');
-const forceBdg    = document.getElementById('forceBadge');
 const repulsionSl  = document.getElementById('repulsionSlider');
 const repulsionBdg = document.getElementById('repulsionBadge');
-const borderSl     = document.getElementById('borderSlider');
-const borderBdg    = document.getElementById('borderBadge');
+const restitutionSl = document.getElementById('restitutionSlider');
+const restitutionBdg = document.getElementById('restitutionBadge');
+const viscositySl = document.getElementById('viscositySlider');
+const viscosityBdg = document.getElementById('viscosityBadge');
+const densityStiffnessSl = document.getElementById('densityStiffnessSlider');
+const densityStiffnessBdg = document.getElementById('densityStiffnessBadge');
+const gravitySl    = document.getElementById('gravitySlider');
+const gravityBdg   = document.getElementById('gravityBadge');
 const vfOverlayCb  = document.getElementById('vfOverlay');
 const cellBtn      = document.getElementById('cellBtn');
 
@@ -249,22 +271,29 @@ const cellBtn      = document.getElementById('cellBtn');
 const sim = {
   worldWidth:    1920,
   worldHeight:   1080,
-  gridCols:      32,
-  gridRows:      16,
-  falloffRadius: 160,
-  forceScale:    20000,
+  gridCols:      64,
+  gridRows:      36,
   particleRadius: 8,
-  repulsion:     500,
-  borderForce:   200,
+  
+  // Physics parameters
+  repulsion:      1000,   // collision repulsion strength
+  restitution:    0.5,    // collision bounce factor
+  viscosity:      0.01,   // fluid viscosity
+  densityStiffness: 100,  // SPH pressure stiffness
+  gravity:        0,      // downward acceleration
+  
+  // Spatial hashing
+  gridCellSize:   GRID_CELL_SIZE,
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  GPU state
 // ─────────────────────────────────────────────────────────────────────────────
 let device, context, canvasFormat;
-let particleBuf, fieldBuf, uniformBuf, cellLinkBuf, injectorTimerBuf;
-let vfPipeline, updatePipeline, renderPipeline, arrowPipeline;
-let vfBG, updateBG, renderBG, arrowBG;
+let particleBuf, fieldBuf, uniformBuf;
+let hashBuf, sortedIndexBuf, cellStartBuf, cellEndBuf;
+let hashPipeline, sortPipeline, cellIndexPipeline, updatePipeline, renderPipeline;
+let hashBG, sortBG, cellIndexBG, updateBG, renderBG;
 let showVectorField = false;
 let placingCell     = false;
 
@@ -273,151 +302,158 @@ let lastTs = 0;
 let rafId  = null;
 let simTime = 0;
 
+// Grid dimensions (computed from world size and cell size)
+let gridWidth = 0, gridHeight = 0, gridSize = 0;
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  WGSL — vector-field generation  (compute)
+//  WGSL — Spatial Hashing (compute)
 // ─────────────────────────────────────────────────────────────────────────────
-//  Each grid cell accumulates radial push forces from every particle within
-//  the falloff radius.  The result is written to a flat array of vec2f.
-// ─────────────────────────────────────────────────────────────────────────────
-const VECTOR_FIELD_WGSL = /* wgsl */`
+const HASH_WGSL = /* wgsl */`
 
 struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
+struct HashEntry { hash: u32, index: u32 }
 
 struct Params {
-  worldW   : f32, worldH   : f32,
-  gridCols : u32, gridRows : u32,
-  falloff  : f32, force    : f32,
-  count    : u32, dt       : f32,
-  radius   : f32, repulsion : f32, borderForce : f32, time : f32,
+  worldW: f32, worldH: f32,
+  gridCols: u32, gridRows: u32,
+  gridCellSize: f32, count: u32, dt: f32, time: f32,
+  repulsion: f32, restitution: f32, viscosity: f32,
+  densityStiffness: f32, gravity: f32, particleRadius: f32,
 }
 
-struct CellLink {
-  prev : u32,
-  next : u32,
-  restDist : f32,
-  restAngle : f32,
-  cellStart : u32,
-  cellSize : u32,
-  chainIdx : u32,
-  ptype : u32,
-}
+@group(0) @binding(0) var<uniform> params : Params;
+@group(0) @binding(1) var<storage, read> pts : array<Particle>;
+@group(0) @binding(2) var<storage, read_write> hashBuffer : array<HashEntry>;
 
-@group(0) @binding(0) var<uniform>             params : Params;
-@group(0) @binding(1) var<storage, read>       pts    : array<Particle>;
-@group(0) @binding(2) var<storage, read_write> field  : array<vec2f>;
-@group(0) @binding(3) var<storage, read>       cellLinks : array<CellLink>;
-
-@compute @workgroup_size(8, 8)
+@compute @workgroup_size(64)
 fn main(@builtin(global_invocation_id) gid : vec3u) {
-  let col = gid.x;
-  let row = gid.y;
-  if (col >= params.gridCols || row >= params.gridRows) { return; }
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
 
-  // World-space centre of this cell
-  let cx = (f32(col) + 0.5) / f32(params.gridCols) * params.worldW;
-  let cy = (f32(row) + 0.5) / f32(params.gridRows) * params.worldH;
-  let cellPos = vec2f(cx, cy);
+  let pt = pts[idx];
+  let cellX = u32(floor(pt.pos.x / params.gridCellSize));
+  let cellY = u32(floor(pt.pos.y / params.gridCellSize));
 
-  var force = vec2f(0.0);
-  let R = params.falloff;
+  // Clamp to grid bounds
+  let gridX = clamp(cellX, 0u, params.gridCols - 1u);
+  let gridY = clamp(cellY, 0u, params.gridRows - 1u);
 
-  for (var i = 0u; i < params.count; i++) {
-    let d = cellPos - pts[i].pos;
-    let r = length(d);
-    if (r > 0.001 && r < R) {
-      let link = cellLinks[i];
-      if (link.ptype == 4u) { continue; }  // absorbed particles have no field effect
-
-      let t = 1.0 - r / R;
-      // Radial push: outward from the particle centre,
-      // weighted by a quadratic falloff that reaches zero at r = R.
-      force += (d / r) * (t * t);
-
-      // For cell particles, inject velocity-aligned flow into the field
-      // to assist the cell's movement through the fluid
-      if (link.ptype == 1u || link.ptype == 2u || link.ptype == 3u) {
-        let vel = pts[i].vel;
-        let vMag = length(vel);
-        if (vMag > 0.1) {
-          force += (vel / vMag) * (t * t) * 3.0;
-        }
-      }
-    }
-  }
-
-  // Normalise by particle count so the field amplitude stays consistent
-  // regardless of how many particles are present.
-  var totalForce = force / f32(max(params.count, 1u)) * params.force;
-
-  // Boundary push: cells near edges get an inward-pointing force
-  let margin = params.falloff;
-  let bF = params.borderForce;
-  if (cx < margin)                { let t = 1.0 - cx / margin;                totalForce.x += bF * t * t; }
-  if (cx > params.worldW - margin) { let t = 1.0 - (params.worldW - cx) / margin; totalForce.x -= bF * t * t; }
-  if (cy < margin)                { let t = 1.0 - cy / margin;                totalForce.y += bF * t * t; }
-  if (cy > params.worldH - margin) { let t = 1.0 - (params.worldH - cy) / margin; totalForce.y -= bF * t * t; }
-
-  field[row * params.gridCols + col] = totalForce;
+  let hash = gridX + gridY * params.gridCols;
+  hashBuffer[idx] = HashEntry(hash, idx);
 }
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WGSL — particle integration  (compute)
+//  WGSL — Bitonic Sort (compute)
 // ─────────────────────────────────────────────────────────────────────────────
-//  Each particle samples the vector field via bilinear interpolation and
-//  integrates its velocity + position with simple Euler + damping.
+const SORT_WGSL = /* wgsl */`
+
+struct HashEntry { hash: u32, index: u32 }
+
+@group(0) @binding(0) var<storage, read_write> hashBuffer : array<HashEntry>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= arrayLength(&hashBuffer)) { return; }
+
+  // Simplified: Single pass bitonic sort stage (would need multiple passes in full implementation)
+  // For now, use basic bubble sort approach in compute shader
+  for (var i = idx + 1u; i < arrayLength(&hashBuffer); i++) {
+    if (hashBuffer[idx].hash > hashBuffer[i].hash) {
+      let temp = hashBuffer[idx];
+      hashBuffer[idx] = hashBuffer[i];
+      hashBuffer[i] = temp;
+    }
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Build Cell Index (compute)
+// ─────────────────────────────────────────────────────────────────────────────
+const CELL_INDEX_WGSL = /* wgsl */`
+
+struct HashEntry { hash: u32, index: u32 }
+struct Params {
+  worldW: f32, worldH: f32,
+  gridCols: u32, gridRows: u32,
+  gridCellSize: f32, count: u32, dt: f32, time: f32,
+  repulsion: f32, restitution: f32, viscosity: f32,
+  densityStiffness: f32, gravity: f32, particleRadius: f32,
+}
+
+@group(0) @binding(0) var<uniform> params : Params;
+@group(0) @binding(1) var<storage, read> hashBuffer : array<HashEntry>;
+@group(0) @binding(2) var<storage, read_write> cellStart : array<atomic<u32>>;
+@group(0) @binding(3) var<storage, read_write> cellEnd : array<atomic<u32>>;
+
+@compute @workgroup_size(64)
+fn main(@builtin(global_invocation_id) gid : vec3u) {
+  let idx = gid.x;
+  if (idx >= params.count) { return; }
+
+  let hash = hashBuffer[idx].hash;
+  let prevHash = select(0xFFFFFFFFu, hashBuffer[idx - 1u].hash, idx > 0u);
+
+  if (hash != prevHash) {
+    atomicStore(&cellStart[hash], idx);
+  }
+
+  let nextHash = select(0xFFFFFFFFu, hashBuffer[idx + 1u].hash, idx < params.count - 1u);
+  if (hash != nextHash) {
+    atomicStore(&cellEnd[hash], idx + 1u);
+  }
+}
+`;
+
+// ─────────────────────────────────────────────────────────────────────────────
+//  WGSL — Physics Update (compute)
 // ─────────────────────────────────────────────────────────────────────────────
 const UPDATE_WGSL = /* wgsl */`
 
 struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
-
+struct HashEntry { hash: u32, index: u32 }
 struct Params {
-  worldW   : f32, worldH   : f32,
-  gridCols : u32, gridRows : u32,
-  falloff  : f32, force    : f32,
-  count    : u32, dt       : f32,
-  radius   : f32, repulsion : f32, borderForce : f32, time : f32,
+  worldW: f32, worldH: f32,
+  gridCols: u32, gridRows: u32,
+  gridCellSize: f32, count: u32, dt: f32, time: f32,
+  repulsion: f32, restitution: f32, viscosity: f32,
+  densityStiffness: f32, gravity: f32, particleRadius: f32,
 }
 
-struct CellLink {
-  prev : u32,
-  next : u32,
-  restDist : f32,
-  restAngle : f32,
-  cellStart : u32,
-  cellSize : u32,
-  chainIdx : u32,
-  ptype : u32,
+@group(0) @binding(0) var<uniform> params : Params;
+@group(0) @binding(1) var<storage, read_write> pts : array<Particle>;
+@group(0) @binding(2) var<storage, read> hashBuffer : array<HashEntry>;
+@group(0) @binding(3) var<storage, read> cellStart : array<u32>;
+@group(0) @binding(4) var<storage, read> cellEnd : array<u32>;
+
+const h = 40.0;  // smoothing radius
+const restDensity = 1.0;
+
+fn kernelPoly6(r: f32, h: f32) -> f32 {
+  if (r >= h) { return 0.0; }
+  let q = 1.0 - r / h;
+  return q * q;
 }
 
-@group(0) @binding(0) var<uniform>             params : Params;
-@group(0) @binding(1) var<storage, read_write> pts    : array<Particle>;
-@group(0) @binding(2) var<storage, read>       field  : array<vec2f>;
-@group(0) @binding(3) var<storage, read_write> cellLinks : array<CellLink>;
-@group(0) @binding(4) var<storage, read_write> injectorTimers : array<atomic<u32>>;
-
-// Bilinear sample of the vector field at a world-space position.
-fn sampleField(pos : vec2f) -> vec2f {
-  let gx = pos.x / params.worldW * f32(params.gridCols) - 0.5;
-  let gy = pos.y / params.worldH * f32(params.gridRows) - 0.5;
-  let c0 = i32(floor(gx));
-  let r0 = i32(floor(gy));
-  let tx = gx - f32(c0);
-  let ty = gy - f32(r0);
-
-  let maxC = i32(params.gridCols) - 1;
-  let maxR = i32(params.gridRows) - 1;
-
-  let i00 = u32(clamp(r0,   0, maxR)) * params.gridCols + u32(clamp(c0,   0, maxC));
-  let i10 = u32(clamp(r0,   0, maxR)) * params.gridCols + u32(clamp(c0+1, 0, maxC));
-  let i01 = u32(clamp(r0+1, 0, maxR)) * params.gridCols + u32(clamp(c0,   0, maxC));
-  let i11 = u32(clamp(r0+1, 0, maxR)) * params.gridCols + u32(clamp(c0+1, 0, maxC));
-
-  return mix(
-    mix(field[i00], field[i10], tx),
-    mix(field[i01], field[i11], tx),
-    ty
-  );
+fn getNeighbours(cellIdx: u32) -> array<u32, 9> {
+  var indices: array<u32, 9>;
+  let cellX = cellIdx % params.gridCols;
+  let cellY = cellIdx / params.gridCols;
+  
+  var count = 0u;
+  for (var dy: i32 = -1; dy <= 1; dy++) {
+    for (var dx: i32 = -1; dx <= 1; dx++) {
+      let nx = i32(cellX) + dx;
+      let ny = i32(cellY) + dy;
+      if (nx >= 0 && nx < i32(params.gridCols) && ny >= 0 && ny < i32(params.gridRows)) {
+        indices[count] = u32(nx) + u32(ny) * params.gridCols;
+        count++;
+      }
+    }
+  }
+  return indices;
 }
 
 @compute @workgroup_size(64)
@@ -426,285 +462,108 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   if (idx >= params.count) { return; }
 
   var pt = pts[idx];
-  let link = cellLinks[idx];
+  let cellX = u32(floor(pt.pos.x / params.gridCellSize));
+  let cellY = u32(floor(pt.pos.y / params.gridCellSize));
+  let cellIdx = clamp(cellX, 0u, params.gridCols - 1u) + clamp(cellY, 0u, params.gridRows - 1u) * params.gridCols;
 
-  // ── Absorbed food: gentle centering force but still obeys physics ──
-  if (link.ptype == 4u) {
-    var centroid = vec2f(0.0);
-    for (var c = 0u; c < link.cellSize; c++) {
-      centroid += pts[link.cellStart + c].pos;
-    }
-    centroid /= f32(link.cellSize);
-    let toCentroid = centroid - pt.pos;
-    let distCentroid = length(toCentroid);
-    if (distCentroid > params.radius * 2.0) {
-      pt.vel += (toCentroid / distCentroid) * 80.0 * params.dt;
-    } else {
-      pt.vel += toCentroid * 5.0 * params.dt;
-    }
-    // Fall through to normal repulsion + field integration below
-  }
+  // Get neighbouring cells
+  let neighbourCells = getNeighbours(cellIdx);
 
-  // Particle-particle repulsion for nearby particles
-  var nearestInjector = 0xFFFFFFFFu;
-  var nearestInjDist = params.radius * 4.0;
-  var foodDir = vec2f(0.0);  // food gradient (for cell particles)
-  let repR = params.radius * 4.0;
-  for (var j = 0u; j < params.count; j++) {
-    if (j == idx) { continue; }
-    // Skip repulsion between linked membrane neighbours
-    if (link.prev != 0xFFFFFFFFu && (j == link.prev || j == link.next)) { continue; }
-    let delta = pt.pos - pts[j].pos;
-    let dist = length(delta);
-    if (dist > 0.001 && dist < repR) {
-      let jLink = cellLinks[j];
-      // Skip repulsion between food and any membrane/injector particle
-      let skipRepulsion = (link.ptype == 5u && (jLink.ptype == 3u || jLink.ptype == 1u))
-                       || ((link.ptype == 3u || link.ptype == 1u) && jLink.ptype == 5u);
-      if (!skipRepulsion) {
-        let t = 1.0 - dist / repR;
-        pt.vel += normalize(delta) * t * t * params.repulsion * params.dt;
+  var density = 0.0;
+  var pressureForce = vec2f(0.0);
+  var viscosityForce = vec2f(0.0);
+
+  // Iterate through all 9 neighbouring cells
+  for (var c = 0u; c < 9u; c++) {
+    let neighbourCell = neighbourCells[c];
+    let start = cellStart[neighbourCell];
+    let end = cellEnd[neighbourCell];
+
+    for (var j = start; j < end; j++) {
+      if (j == idx) { continue; }
+      
+      let other = pts[j];
+      let delta = other.pos - pt.pos;
+      let dist = length(delta);
+
+      // SPH kernel density
+      if (dist < h) {
+        let q = 1.0 - dist / h;
+        density += q * q;
       }
-    }
-    // Food particles: track nearest READY injector within attraction range
-    if (link.ptype == 5u
-        && dist > 0.001 && dist < params.radius * 4.0 && dist < nearestInjDist) {
-      if (cellLinks[j].ptype == 3u) {
-        // Only attract if this injector's cooldown has expired
-        let timer = atomicLoad(&injectorTimers[j]);
-        let currentTime = u32(params.time * 1000.0);
-        if (currentTime >= timer) {
-          nearestInjDist = dist;
-          nearestInjector = j;
+
+      // Collision response
+      let minDist = params.particleRadius * 2.0;
+      if (dist < minDist && dist > 0.001) {
+        let n = delta / dist;
+        let overlap = minDist - dist;
+        pt.pos += n * overlap * 0.5;
+
+        let relVel = dot(pt.vel - other.vel, n);
+        if (relVel < 0.0) {
+          let impulse = -(1.0 + params.restitution) * relVel * 0.5;
+          pt.vel += n * impulse;
         }
       }
-    }
-    // Food gradient detection for cell particles (flagella use this to steer)
-    if ((link.ptype == 1u || link.ptype == 2u || link.ptype == 3u)
-        && cellLinks[j].ptype == 5u
-        && dist > 0.001 && dist < params.falloff * 2.0) {
-      let w = 1.0 / (dist * dist + 100.0);
-      foodDir += (pts[j].pos - pt.pos) / dist * w;
-    }
-  }
 
-  // ── Cell membrane constraints (spring + bending + pressure) ────────
-  if (link.ptype == 1u || link.ptype == 3u) {
-    let pPrev = pts[link.prev].pos;
-    let pNext = pts[link.next].pos;
-
-    // Linear spring to previous neighbour
-    let dPrev = pPrev - pt.pos;
-    let distPrev = length(dPrev);
-    if (distPrev > 0.001) {
-      let stretch = (distPrev - link.restDist) / link.restDist;
-      pt.vel += (dPrev / distPrev) * stretch * 2000.0 * params.dt;
-    }
-
-    // Linear spring to next neighbour
-    let dNext = pNext - pt.pos;
-    let distNext = length(dNext);
-    if (distNext > 0.001) {
-      let stretch = (distNext - link.restDist) / link.restDist;
-      pt.vel += (dNext / distNext) * stretch * 2000.0 * params.dt;
-    }
-
-    // Bending resistance: push particle toward the midpoint of its
-    // neighbours when the angle deviates from rest.
-    if (distPrev > 0.001 && distNext > 0.001) {
-      let mid = (pPrev + pNext) * 0.5;
-      let toMid = mid - pt.pos;
-      let toMidLen = length(toMid);
-
-      let toA = dPrev / distPrev;
-      let toC = dNext / distNext;
-      let cosA = clamp(dot(toA, toC), -1.0, 1.0);
-      let angle = acos(cosA);
-      let diff = angle - link.restAngle;
-
-      let halfEdge = link.restDist * 0.5;
-      let idealMidDist = halfEdge / tan(link.restAngle * 0.5);
-
-      if (toMidLen > 0.001) {
-        let error = toMidLen - idealMidDist;
-        var k = 3000.0;
-        if (abs(diff) > 0.5236) { k = 15000.0; }
-        pt.vel += (toMid / toMidLen) * error * k * params.dt;
-      }
-    }
-
-    // Internal pressure: compute cell centroid, push outward
-    var centroid = vec2f(0.0);
-    for (var c = 0u; c < link.cellSize; c++) {
-      centroid += pts[link.cellStart + c].pos;
-    }
-    centroid /= f32(link.cellSize);
-    let toOut = pt.pos - centroid;
-    let distC = length(toOut);
-    if (distC > 0.001) {
-      pt.vel += (toOut / distC) * 300.0 * params.dt;
-    }
-  }
-
-  // ── Flagella constraints (spring chain + coordinated beating) ─────
-  if (link.ptype == 2u) {
-    // Spring to previous particle (always exists for flagella)
-    let prevPos = pts[link.prev].pos;
-    let dPrev = prevPos - pt.pos;
-    let distPrev = length(dPrev);
-    if (distPrev > 0.001) {
-      let stretch = (distPrev - link.restDist) / link.restDist;
-      pt.vel += (dPrev / distPrev) * stretch * 2000.0 * params.dt;
-    }
-
-    // Spring to next particle (if not the tip)
-    if (link.next != 0xFFFFFFFFu) {
-      let nextPos = pts[link.next].pos;
-      let dNext = nextPos - pt.pos;
-      let distNext = length(dNext);
-      if (distNext > 0.001) {
-        let stretch = (distNext - link.restDist) / link.restDist;
-        pt.vel += (dNext / distNext) * stretch * 2000.0 * params.dt;
-      }
-    }
-
-    // Prevent flagella from entering the cell interior
-    var centroid = vec2f(0.0);
-    for (var c = 0u; c < link.cellSize; c++) {
-      centroid += pts[link.cellStart + c].pos;
-    }
-    centroid /= f32(link.cellSize);
-    let toOut = pt.pos - centroid;
-    let distC = length(toOut);
-    // Find the membrane anchor (root particle's prev is the membrane particle)
-    let rootIdx = link.prev;
-    var anchorPos = prevPos;
-    if (link.chainIdx > 0u) {
-      // Walk back to find anchor: for chainIdx > 0, anchor is chainIdx steps before
-      // But we can approximate using the centroid + outward direction from anchor
-      anchorPos = prevPos;
-    }
-    let anchorDist = length(anchorPos - centroid);
-    // If this particle is closer to centroid than the membrane, push it outward
-    if (distC < anchorDist && distC > 0.001) {
-      pt.vel += (toOut / distC) * 800.0 * params.dt;
-    }
-
-    // Movement target: random walk + food gradient from flagella receptors
-    // Distance-based wander: change direction after ~1/3 world distance
-    let cellSeed = f32(link.cellStart);
-    let wanderDist = params.worldW * 0.33;
-    // Use cell velocity to estimate distance traveled per step
-    // Approximate: use time * avg_speed, where speed ~ 50-100 units/s
-    let wanderPeriod = wanderDist / 80.0;  // time to travel 1/3 world at ~80 u/s
-    let wanderStep = floor(params.time / wanderPeriod);
-    // Hash the step index to get a pseudo-random angle
-    let h = wanderStep * 127.1 + cellSeed * 311.7;
-    let wanderAngle = fract(sin(h) * 43758.5453) * 6.2832;
-    let wanderDir = vec2f(cos(wanderAngle), sin(wanderAngle));
-    let foodMag = length(foodDir);
-    var moveDir = wanderDir;
-    if (foodMag > 0.001) {
-      // Food signal dominates when detected; wander provides baseline
-      moveDir = normalize(foodDir) * min(foodMag * 50.0, 1.0) + wanderDir * 0.3;
-    }
-    let moveDirLen = length(moveDir);
-    if (moveDirLen > 0.001) {
-      moveDir = moveDir / moveDirLen;
-    }
-    // Determine which side of the cell this flagella is on
-    let outDir2 = normalize(pt.pos - centroid);
-    let alignment = dot(outDir2, moveDir);
-    // Flagella on opposite side beat harder — creates thrust toward target
-    let sideAmp = 1.0 - alignment * 0.6;
-
-    // Coordinated power stroke for directional movement
-    if (distPrev > 0.001) {
-      let chainDir = dPrev / distPrev;
-      let perp = vec2f(-chainDir.y, chainDir.x);
-
-      // Asymmetric beat cycle: 2*PI period
-      let cycle = params.time * 8.0;
-      let t = cycle - floor(cycle / 6.2832) * 6.2832;
-      // Power stroke (0 to PI): strong, fast
-      // Recovery stroke (PI to 2*PI): weak, slow
-      var beatForce = 0.0;
-      if (t < 3.1416) {
-        beatForce = sin(t) * 1.0;  // strong push
-      } else {
-        beatForce = sin(t) * 0.3;  // weak recovery
-      }
-
-      let phase = f32(link.chainIdx) * 0.8;  // wave propagation along chain
-      let amp = 120.0 * (f32(link.chainIdx) + 1.0) / 7.0;
-      pt.vel += perp * sin(cycle - phase) * beatForce * amp * sideAmp * params.dt;
-    }
-
-    // Direct movement bias toward target direction
-    pt.vel += moveDir * 30.0 * params.dt;
-  }
-
-  // ── Injector absorption: only food (green) particles can be absorbed ─
-  if (link.ptype == 5u && nearestInjector != 0xFFFFFFFFu) {
-    let injPos = pts[nearestInjector].pos;
-    let toInj = injPos - pt.pos;
-    let dist = nearestInjDist;
-    let attractR = params.radius * 4.0;
-    // Attraction force toward the injector
-    if (dist > 0.001) {
-      let strength = 1.0 - dist / attractR;
-      pt.vel += normalize(toInj) * strength * 600.0 * params.dt;
-    }
-    // Close enough to absorb? (direct teleport into absorbed state)
-    if (dist < params.radius * 3.5) {
-      let currentTime = u32(params.time * 1000.0);
-      let timer = atomicLoad(&injectorTimers[nearestInjector]);
-      if (currentTime >= timer) {
-        let result = atomicCompareExchangeWeak(&injectorTimers[nearestInjector], timer, currentTime + 5000u);
-        if (result.exchanged) {
-          let injLink = cellLinks[nearestInjector];
-          cellLinks[idx].ptype = 4u;
-          cellLinks[idx].cellStart = injLink.cellStart;
-          cellLinks[idx].cellSize = injLink.cellSize;
-          cellLinks[idx].prev = nearestInjector;
-          cellLinks[idx].next = 0xFFFFFFFFu;
-        }
+      // Viscosity (smoothing velocity)
+      if (dist < h && dist > 0.001) {
+        pt.vel += (other.vel - pt.vel) * params.viscosity * params.dt;
       }
     }
   }
 
-  // Integrate velocity from the field force
-  pt.vel = pt.vel * 0.98 + sampleField(pt.pos) * params.dt;
+  // Pressure correction (SPH-lite density constraint)
+  let pressure = max(0.0, density - restDensity);
+  for (var c = 0u; c < 9u; c++) {
+    let neighbourCell = neighbourCells[c];
+    let start = cellStart[neighbourCell];
+    let end = cellEnd[neighbourCell];
 
-  // Clamp speed to 40 % of world width per second
+    for (var j = start; j < end; j++) {
+      if (j == idx) { continue; }
+      
+      let other = pts[j];
+      let delta = other.pos - pt.pos;
+      let dist = length(delta);
+
+      if (dist < h && dist > 0.001) {
+        let q = 1.0 - dist / h;
+        let n = delta / dist;
+        pt.pos -= n * pressure * q * params.densityStiffness * 0.5 * params.dt;
+      }
+    }
+  }
+
+  // Apply gravity
+  pt.vel.y += params.gravity * params.dt;
+
+  // Damping
+  pt.vel *= 0.995;
+
+  // Clamp speed
   let spd = length(pt.vel);
   let cap = params.worldW * 0.4;
   if (spd > cap) { pt.vel = pt.vel / spd * cap; }
 
-  // Euler position step
+  // Euler integration
   pt.pos = pt.pos + pt.vel * params.dt;
 
-  // Boundary push: apply inward force near edges
-  let margin = params.falloff;
-  let bF = params.borderForce;
-  if (pt.pos.x < margin)                 { let t = 1.0 - pt.pos.x / margin;                 pt.vel.x += bF * t * t * params.dt; }
-  if (pt.pos.x > params.worldW - margin) { let t = 1.0 - (params.worldW - pt.pos.x) / margin; pt.vel.x -= bF * t * t * params.dt; }
-  if (pt.pos.y < margin)                 { let t = 1.0 - pt.pos.y / margin;                 pt.vel.y += bF * t * t * params.dt; }
-  if (pt.pos.y > params.worldH - margin) { let t = 1.0 - (params.worldH - pt.pos.y) / margin; pt.vel.y -= bF * t * t * params.dt; }
-
-  // Hard clamp to world bounds (safety net)
-  pt.pos.x = clamp(pt.pos.x, 0.0, params.worldW);
-  pt.pos.y = clamp(pt.pos.y, 0.0, params.worldH);
+  // Boundary reflection
+  let r = params.particleRadius;
+  if (pt.pos.x < r) { pt.pos.x = r; pt.vel.x *= -params.restitution; }
+  if (pt.pos.x > params.worldW - r) { pt.pos.x = params.worldW - r; pt.vel.x *= -params.restitution; }
+  if (pt.pos.y < r) { pt.pos.y = r; pt.vel.y *= -params.restitution; }
+  if (pt.pos.y > params.worldH - r) { pt.pos.y = params.worldH - r; pt.vel.y *= -params.restitution; }
 
   pts[idx] = pt;
 }
 `;
 
+
+
 // ─────────────────────────────────────────────────────────────────────────────
-//  WGSL — render  (vertex + fragment)
-// ─────────────────────────────────────────────────────────────────────────────
-//  Each particle is an instanced 6-vertex quad; the fragment shader clips
-//  to a unit circle and applies a smooth anti-aliased edge.
+//  WGSL — Render particles (vertex + fragment)
 // ─────────────────────────────────────────────────────────────────────────────
 const RENDER_WGSL = /* wgsl */`
 
@@ -715,7 +574,7 @@ struct Params {
   gridCols : u32, gridRows : u32,
   falloff  : f32, force    : f32,
   count    : u32, dt       : f32,
-  radius   : f32, repulsion : f32, borderForce : f32, time : f32,
+  radius   : f32, repulsion : f32, borderForce : f32, time : f32, gravity : f32,
 }
 
 @group(0) @binding(0) var<uniform>       params : Params;
@@ -782,7 +641,7 @@ struct Params {
   gridCols : u32, gridRows : u32,
   falloff  : f32, force    : f32,
   count    : u32, dt       : f32,
-  radius   : f32, repulsion : f32, borderForce : f32, time : f32,
+  radius   : f32, repulsion : f32, borderForce : f32, time : f32, gravity : f32,
 }
 
 @group(0) @binding(0) var<uniform>       params : Params;
@@ -904,35 +763,54 @@ function createBuffers() {
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  cellLinkBuf = device.createBuffer({
-    label: 'cellLinks',
-    size:  MAX_PARTICLES * CELL_LINK_BYTES,
+  hashBuf = device.createBuffer({
+    label: 'hash',
+    size:  MAX_PARTICLES * HASH_ENTRY_BYTES,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
-  injectorTimerBuf = device.createBuffer({
-    label: 'injectorTimers',
+  sortedIndexBuf = device.createBuffer({
+    label: 'sortedIndex',
     size:  MAX_PARTICLES * 4,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
-  // Initialise all cell-link entries to "no link" sentinel (0xFFFFFFFF)
-  const sentinel = new Uint8Array(MAX_PARTICLES * CELL_LINK_BYTES);
-  sentinel.fill(0xFF);
-  device.queue.writeBuffer(cellLinkBuf, 0, sentinel);
+  cellStartBuf = device.createBuffer({
+    label: 'cellStart',
+    size:  MAX_GRID_DIM * MAX_GRID_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  cellEndBuf = device.createBuffer({
+    label: 'cellEnd',
+    size:  MAX_GRID_DIM * MAX_GRID_DIM * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Pipeline creation
 // ─────────────────────────────────────────────────────────────────────────────
 function createPipelines() {
-  const vfMod     = device.createShaderModule({ code: VECTOR_FIELD_WGSL });
+  const hashMod  = device.createShaderModule({ code: HASH_WGSL });
+  const sortMod  = device.createShaderModule({ code: SORT_WGSL });
+  const cellIdxMod = device.createShaderModule({ code: CELL_INDEX_WGSL });
   const updateMod = device.createShaderModule({ code: UPDATE_WGSL });
   const renderMod = device.createShaderModule({ code: RENDER_WGSL });
 
-  vfPipeline = device.createComputePipeline({
+  hashPipeline = device.createComputePipeline({
     layout:  'auto',
-    compute: { module: vfMod, entryPoint: 'main' },
+    compute: { module: hashMod, entryPoint: 'main' },
+  });
+
+  sortPipeline = device.createComputePipeline({
+    layout:  'auto',
+    compute: { module: sortMod, entryPoint: 'main' },
+  });
+
+  cellIndexPipeline = device.createComputePipeline({
+    layout:  'auto',
+    compute: { module: cellIdxMod, entryPoint: 'main' },
   });
 
   updatePipeline = device.createComputePipeline({
@@ -942,10 +820,10 @@ function createPipelines() {
 
   renderPipeline = device.createRenderPipeline({
     layout:   'auto',
-    vertex:   { module: renderMod, entryPoint: 'vs' },
+    vertex:   { module: renderMod, entryPoint: 'vertexMain' },
     fragment: {
       module:  renderMod,
-      entryPoint: 'fs',
+      entryPoint: 'fragmentMain',
       targets: [{
         format: canvasFormat,
         blend: {
@@ -964,72 +842,54 @@ function createPipelines() {
     },
     primitive: { topology: 'triangle-list' },
   });
-
-  const arrowMod = device.createShaderModule({ code: ARROW_WGSL });
-  arrowPipeline = device.createRenderPipeline({
-    layout:   'auto',
-    vertex:   { module: arrowMod, entryPoint: 'vs' },
-    fragment: {
-      module:  arrowMod,
-      entryPoint: 'fs',
-      targets: [{
-        format: canvasFormat,
-        blend: {
-          color: {
-            srcFactor: 'src-alpha',
-            dstFactor: 'one-minus-src-alpha',
-            operation: 'add',
-          },
-          alpha: {
-            srcFactor: 'one',
-            dstFactor: 'one-minus-src-alpha',
-            operation: 'add',
-          },
-        },
-      }],
-    },
-    primitive: { topology: 'line-list' },
-  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Bind-group creation  (only needs to happen once because buffers never change)
 // ─────────────────────────────────────────────────────────────────────────────
 function createBindGroups() {
-  vfBG = device.createBindGroup({
-    layout:  vfPipeline.getBindGroupLayout(0),
+  hashBG = device.createBindGroup({
+    layout:  hashPipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: { buffer: uniformBuf   } },
-      { binding: 1, resource: { buffer: particleBuf  } },
-      { binding: 2, resource: { buffer: fieldBuf     } },
-      { binding: 3, resource: { buffer: cellLinkBuf  } },
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: particleBuf } },
+      { binding: 2, resource: { buffer: hashBuf } },
+    ],
+  });
+
+  sortBG = device.createBindGroup({
+    layout:  sortPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: hashBuf } },
+    ],
+  });
+
+  cellIndexBG = device.createBindGroup({
+    layout:  cellIndexPipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: hashBuf } },
+      { binding: 2, resource: { buffer: cellStartBuf } },
+      { binding: 3, resource: { buffer: cellEndBuf } },
     ],
   });
 
   updateBG = device.createBindGroup({
     layout:  updatePipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: { buffer: uniformBuf       } },
-      { binding: 1, resource: { buffer: particleBuf      } },
-      { binding: 2, resource: { buffer: fieldBuf         } },
-      { binding: 3, resource: { buffer: cellLinkBuf      } },
-      { binding: 4, resource: { buffer: injectorTimerBuf } },
+      { binding: 0, resource: { buffer: uniformBuf } },
+      { binding: 1, resource: { buffer: particleBuf } },
+      { binding: 2, resource: { buffer: hashBuf } },
+      { binding: 3, resource: { buffer: cellStartBuf } },
+      { binding: 4, resource: { buffer: cellEndBuf } },
     ],
   });
 
   renderBG = device.createBindGroup({
     layout:  renderPipeline.getBindGroupLayout(0),
     entries: [
-      { binding: 0, resource: { buffer: uniformBuf  } },
-      { binding: 1, resource: { buffer: particleBuf } },
-    ],
-  });
-
-  arrowBG = device.createBindGroup({
-    layout:  arrowPipeline.getBindGroupLayout(0),
-    entries: [
       { binding: 0, resource: { buffer: uniformBuf } },
-      { binding: 1, resource: { buffer: fieldBuf   } },
+      { binding: 1, resource: { buffer: particleBuf } },
     ],
   });
 }
@@ -1041,19 +901,21 @@ const _uniformAB = new ArrayBuffer(UNIFORM_BYTES);
 const _uniformDV = new DataView(_uniformAB);
 
 function uploadUniforms(dt) {
-  _uniformDV.setFloat32( 0, sim.worldWidth,    true);
-  _uniformDV.setFloat32( 4, sim.worldHeight,   true);
-  _uniformDV.setUint32 ( 8, sim.gridCols,      true);
-  _uniformDV.setUint32 (12, sim.gridRows,      true);
-  _uniformDV.setFloat32(16, sim.falloffRadius, true);
-  _uniformDV.setFloat32(20, sim.forceScale,    true);
-  _uniformDV.setUint32 (24, particleCount,     true);
-  _uniformDV.setFloat32(28, dt,                true);
-  _uniformDV.setFloat32(32, sim.particleRadius,true);
-  _uniformDV.setFloat32(36, sim.repulsion,     true);
-  _uniformDV.setFloat32(40, sim.borderForce,   true);
+  _uniformDV.setFloat32( 0, sim.worldWidth,         true);
+  _uniformDV.setFloat32( 4, sim.worldHeight,        true);
+  _uniformDV.setUint32 ( 8, sim.gridCols,           true);
+  _uniformDV.setUint32 (12, sim.gridRows,           true);
+  _uniformDV.setFloat32(16, sim.gridCellSize,       true);
+  _uniformDV.setUint32 (20, particleCount,          true);
+  _uniformDV.setFloat32(24, dt,                     true);
   simTime += dt;
-  _uniformDV.setFloat32(44, simTime,           true);
+  _uniformDV.setFloat32(28, simTime,                true);
+  _uniformDV.setFloat32(32, sim.repulsion,          true);
+  _uniformDV.setFloat32(36, sim.restitution,        true);
+  _uniformDV.setFloat32(40, sim.viscosity,          true);
+  _uniformDV.setFloat32(44, sim.densityStiffness,   true);
+  _uniformDV.setFloat32(48, sim.gravity,            true);
+  _uniformDV.setFloat32(52, sim.particleRadius,     true);
   device.queue.writeBuffer(uniformBuf, 0, _uniformAB);
 }
 
@@ -1124,139 +986,14 @@ function addParticles(n) {
   setStatus(`Particles: ${particleCount}`);
 }
 
-function addCell(cx, cy) {
-  const N  = MEMBRANE_SIZE;
-  const FL = FLAGELLA_LENGTH;
-  const FC = FLAGELLA_COUNT;
-  const totalParts = N + FC * FL;
-
-  const memRestDist = sim.particleRadius * 2;   // one diameter apart
-  const R = memRestDist / (2 * Math.sin(Math.PI / N));
-
-  if (particleCount + totalParts > MAX_PARTICLES) {
-    setStatus(`Need ${totalParts} free slots (have ${MAX_PARTICLES - particleCount}).`);
-    return;
-  }
-
-  const baseIdx = particleCount;
-
-  // ── Membrane particles ─────────────────────────────────────────────
-  const flagSpacing = Math.floor(N / FC);
-  const anchorIndices = new Set();
-  for (let f = 0; f < FC; f++) {
-    anchorIndices.add(f * flagSpacing);
-  }
-  const injSpacing = Math.floor(N / INJECTOR_COUNT);
-  const injectorIndices = new Set();
-  for (let ii = 0; ii < INJECTOR_COUNT; ii++) {
-    injectorIndices.add(ii * injSpacing + 2);  // offset to avoid flagella anchors
-  }
-
-  const memF32 = new Float32Array(N * 8);
-  for (let i = 0; i < N; i++) {
-    const angle = (i / N) * 2 * Math.PI;
-    const b = i * 8;
-    memF32[b + 0] = cx + R * Math.cos(angle);
-    memF32[b + 1] = cy + R * Math.sin(angle);
-    memF32[b + 2] = 0;
-    memF32[b + 3] = 0;
-    if (anchorIndices.has(i)) {
-      memF32[b + 4] = 1.0;   // orange (flagella anchor)
-      memF32[b + 5] = 0.55;
-      memF32[b + 6] = 0.1;
-    } else if (injectorIndices.has(i)) {
-      memF32[b + 4] = 1.0;   // red (injector)
-      memF32[b + 5] = 0.1;
-      memF32[b + 6] = 0.1;
-    } else {
-      memF32[b + 4] = 0.15;  // green
-      memF32[b + 5] = 0.85;
-      memF32[b + 6] = 0.35;
-    }
-    memF32[b + 7] = 1.0;   // color.a = 1.0 = full radius
-  }
-  device.queue.writeBuffer(particleBuf, baseIdx * PARTICLE_BYTES, memF32.buffer);
-
-  // ── Membrane cell-link data ────────────────────────────────────────
-  const restAngle = Math.PI * (N - 2) / N;
-  const memLinkAB = new ArrayBuffer(N * CELL_LINK_BYTES);
-  const memLinkDV = new DataView(memLinkAB);
-  for (let i = 0; i < N; i++) {
-    const off = i * CELL_LINK_BYTES;
-    memLinkDV.setUint32 (off + 0,  baseIdx + ((i - 1 + N) % N), true); // prev
-    memLinkDV.setUint32 (off + 4,  baseIdx + ((i + 1)     % N), true); // next
-    memLinkDV.setFloat32(off + 8,  memRestDist,  true);                // restDist
-    memLinkDV.setFloat32(off + 12, restAngle, true);                   // restAngle
-    memLinkDV.setUint32 (off + 16, baseIdx, true);                     // cellStart
-    memLinkDV.setUint32 (off + 20, N, true);                           // cellSize
-    memLinkDV.setUint32 (off + 24, 0, true);                           // chainIdx (unused)
-    memLinkDV.setUint32 (off + 28, injectorIndices.has(i) ? 3 : 1, true); // ptype = 3 (injector) or 1 (membrane)
-  }
-  device.queue.writeBuffer(cellLinkBuf, baseIdx * CELL_LINK_BYTES, memLinkAB);
-
-  // ── Flagella particles + links ─────────────────────────────────────
-  const flagParticles = new Float32Array(FC * FL * 8);
-  const flagLinkAB    = new ArrayBuffer(FC * FL * CELL_LINK_BYTES);
-  const flagLinkDV    = new DataView(flagLinkAB);
-  const flagRestDist  = sim.particleRadius;  // one small-particle diameter
-  const rootDist      = sim.particleRadius * 1.5;  // half big + half small diam
-
-  for (let f = 0; f < FC; f++) {
-    const memI  = f * flagSpacing;               // which membrane particle
-    const angle = (memI / N) * 2 * Math.PI;      // outward direction
-    const dirX  = Math.cos(angle);
-    const dirY  = Math.sin(angle);
-
-    for (let j = 0; j < FL; j++) {
-      const gi = f * FL + j;   // index within flagella block
-      const globalIdx = baseIdx + N + gi;
-
-      // Position extending outward from membrane surface
-      const dist = rootDist + j * flagRestDist;
-      const b = gi * 8;
-      flagParticles[b + 0] = cx + (R + dist) * dirX;
-      flagParticles[b + 1] = cy + (R + dist) * dirY;
-      flagParticles[b + 2] = 0;
-      flagParticles[b + 3] = 0;
-      flagParticles[b + 4] = 1.0;   // orange
-      flagParticles[b + 5] = 0.55;
-      flagParticles[b + 6] = 0.1;
-      flagParticles[b + 7] = 0.5;   // color.a = 0.5 = half radius
-
-      // CellLink data
-      const off = gi * CELL_LINK_BYTES;
-      const prevIdx = (j === 0) ? (baseIdx + memI) : (globalIdx - 1);
-      const nextIdx = (j === FL - 1) ? 0xFFFFFFFF : (globalIdx + 1);
-      const rd = (j === 0) ? rootDist : flagRestDist;
-
-      flagLinkDV.setUint32 (off + 0,  prevIdx, true);       // prev
-      flagLinkDV.setUint32 (off + 4,  nextIdx, true);       // next
-      flagLinkDV.setFloat32(off + 8,  rd, true);             // restDist
-      flagLinkDV.setFloat32(off + 12, 0, true);              // restAngle (unused)
-      flagLinkDV.setUint32 (off + 16, baseIdx, true);        // cellStart
-      flagLinkDV.setUint32 (off + 20, N, true);              // cellSize
-      flagLinkDV.setUint32 (off + 24, j, true);              // chainIdx
-      flagLinkDV.setUint32 (off + 28, 2, true);              // ptype = 2 (flagella)
-    }
-  }
-  device.queue.writeBuffer(particleBuf,  (baseIdx + N) * PARTICLE_BYTES,  flagParticles.buffer);
-  device.queue.writeBuffer(cellLinkBuf,  (baseIdx + N) * CELL_LINK_BYTES, flagLinkAB);
-
-  particleCount += totalParts;
-  setStatus(`Cell added! Particles: ${particleCount}`);
-}
-
 function resetSim() {
   particleCount = 0;
   simTime = 0;
-  // Zero out GPU buffers so stale data does not persist
+  // Zero out GPU buffers
   device.queue.writeBuffer(particleBuf, 0, new Uint8Array(MAX_PARTICLES * PARTICLE_BYTES));
-  device.queue.writeBuffer(fieldBuf,    0, new Uint8Array(MAX_GRID_DIM * MAX_GRID_DIM * 8));
-  // Re-init cell links to sentinel
-  const s = new Uint8Array(MAX_PARTICLES * CELL_LINK_BYTES);
-  s.fill(0xFF);
-  device.queue.writeBuffer(cellLinkBuf, 0, s);
-  device.queue.writeBuffer(injectorTimerBuf, 0, new Uint8Array(MAX_PARTICLES * 4));
+  device.queue.writeBuffer(hashBuf, 0, new Uint8Array(MAX_PARTICLES * HASH_ENTRY_BYTES));
+  device.queue.writeBuffer(cellStartBuf, 0, new Uint8Array(MAX_GRID_DIM * MAX_GRID_DIM * 4));
+  device.queue.writeBuffer(cellEndBuf, 0, new Uint8Array(MAX_GRID_DIM * MAX_GRID_DIM * 4));
   setStatus('Simulation reset.');
 }
 
@@ -1283,25 +1020,36 @@ function frame(ts) {
   const enc = device.createCommandEncoder();
 
   if (particleCount > 0) {
-    // ── Pass 1: generate vector field ─────────────────────────────────────
-    const vfPass = enc.beginComputePass({ label: 'vectorField' });
-    vfPass.setPipeline(vfPipeline);
-    vfPass.setBindGroup(0, vfBG);
-    vfPass.dispatchWorkgroups(
-      Math.ceil(sim.gridCols / 8),
-      Math.ceil(sim.gridRows / 8),
-    );
-    vfPass.end();
+    // ── Pass 1: Compute particle hashes ───────────────────────────────────
+    const hashPass = enc.beginComputePass({ label: 'computeHash' });
+    hashPass.setPipeline(hashPipeline);
+    hashPass.setBindGroup(0, hashBG);
+    hashPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
+    hashPass.end();
 
-    // ── Pass 2: integrate particles ────────────────────────────────────────
-    const upPass = enc.beginComputePass({ label: 'updateParticles' });
-    upPass.setPipeline(updatePipeline);
-    upPass.setBindGroup(0, updateBG);
-    upPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
-    upPass.end();
+    // ── Pass 2: Sort particles by hash ────────────────────────────────────
+    const sortPass = enc.beginComputePass({ label: 'sortByHash' });
+    sortPass.setPipeline(sortPipeline);
+    sortPass.setBindGroup(0, sortBG);
+    sortPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
+    sortPass.end();
+
+    // ── Pass 3: Build cell start/end indices ──────────────────────────────
+    const cellIdxPass = enc.beginComputePass({ label: 'buildCellIndex' });
+    cellIdxPass.setPipeline(cellIndexPipeline);
+    cellIdxPass.setBindGroup(0, cellIndexBG);
+    cellIdxPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
+    cellIdxPass.end();
+
+    // ── Pass 4: Physics update with neighbor lookup ───────────────────────
+    const physicsPass = enc.beginComputePass({ label: 'updatePhysics' });
+    physicsPass.setPipeline(updatePipeline);
+    physicsPass.setBindGroup(0, updateBG);
+    physicsPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
+    physicsPass.end();
   }
 
-  // ── Pass 3: render ─────────────────────────────────────────────────────
+  // ── Pass 5: Render particles ───────────────────────────────────────────
   const renderPass = enc.beginRenderPass({
     colorAttachments: [{
       view:       context.getCurrentTexture().createView(),
@@ -1314,16 +1062,8 @@ function frame(ts) {
   if (particleCount > 0) {
     renderPass.setPipeline(renderPipeline);
     renderPass.setBindGroup(0, renderBG);
-    // 6 vertices per instance (two-triangle quad), one instance per particle
+    // 6 vertices per particle (two-triangle quad)
     renderPass.draw(6, particleCount);
-  }
-
-  // ── Vector-field overlay (arrows) ────────────────────────────────────
-  if (showVectorField) {
-    renderPass.setPipeline(arrowPipeline);
-    renderPass.setBindGroup(0, arrowBG);
-    // 6 vertices per instance (3 line segments), one instance per grid cell
-    renderPass.draw(6, sim.gridCols * sim.gridRows);
   }
 
   renderPass.end();
@@ -1361,31 +1101,29 @@ function wireUI() {
     sim.worldHeight = Math.max(100, parseInt(worldHInput.value, 10) || 1080);
   });
 
-  falloffSl.addEventListener('input', () => {
-    sim.falloffRadius = parseInt(falloffSl.value, 10);
-    falloffBdg.textContent = falloffSl.value;
-  });
-
-  gridColsIn.addEventListener('change', () => {
-    sim.gridCols = Math.min(MAX_GRID_DIM, Math.max(4, parseInt(gridColsIn.value, 10) || 64));
-  });
-  gridRowsIn.addEventListener('change', () => {
-    sim.gridRows = Math.min(MAX_GRID_DIM, Math.max(4, parseInt(gridRowsIn.value, 10) || 36));
-  });
-
-  forceSl.addEventListener('input', () => {
-    sim.forceScale = parseInt(forceSl.value, 10);
-    forceBdg.textContent = forceSl.value;
-  });
-
   repulsionSl.addEventListener('input', () => {
     sim.repulsion = parseInt(repulsionSl.value, 10);
     repulsionBdg.textContent = repulsionSl.value;
   });
 
-  borderSl.addEventListener('input', () => {
-    sim.borderForce = parseInt(borderSl.value, 10);
-    borderBdg.textContent = borderSl.value;
+  restitutionSl.addEventListener('input', () => {
+    sim.restitution = parseFloat(restitutionSl.value);
+    restitutionBdg.textContent = restitutionSl.value;
+  });
+
+  viscositySl.addEventListener('input', () => {
+    sim.viscosity = parseFloat(viscositySl.value);
+    viscosityBdg.textContent = viscositySl.value;
+  });
+
+  densityStiffnessSl.addEventListener('input', () => {
+    sim.densityStiffness = parseInt(densityStiffnessSl.value, 10);
+    densityStiffnessBdg.textContent = densityStiffnessSl.value;
+  });
+
+  gravitySl.addEventListener('input', () => {
+    sim.gravity = parseInt(gravitySl.value, 10);
+    gravityBdg.textContent = gravitySl.value;
   });
 
   vfOverlayCb.addEventListener('change', () => {
@@ -1405,7 +1143,7 @@ function wireUI() {
     const py = e.clientY - rect.top;
     const worldX = (px / rect.width)  * sim.worldWidth;
     const worldY = (py / rect.height) * sim.worldHeight;
-    addCell(worldX, worldY);
+    window.cellSystem.addCell(worldX, worldY, device, particleBuf, null, particleCount, MAX_PARTICLES, sim);
     placingCell = false;
     cellBtn.style.background = '#225544';
     canvas.style.cursor = '';
@@ -1444,5 +1182,8 @@ function setStatus(msg) {
   }
 })();
 </script>
+
+<!-- Cell system module -->
+<script src="cell_system.js"></script>
 </body>
 </html>
