@@ -148,28 +148,6 @@
     <input type="number" id="worldH" value="1080" min="100" max="99999" step="10">
   </div>
 
-  <!-- Falloff range slider -->
-  <div class="ctrl-group">
-    <label for="falloffSlider">Falloff range:</label>
-    <input type="range" id="falloffSlider" min="10" max="800" value="160" step="5">
-    <span class="val-badge" id="falloffBadge">160</span>
-  </div>
-
-  <!-- Vector-field grid size -->
-  <div class="ctrl-group">
-    <label>Grid size:</label>
-    <input type="number" id="gridCols" value="64" min="4" max="256" step="1">
-    <span class="sep">×</span>
-    <input type="number" id="gridRows" value="36" min="4" max="256" step="1">
-  </div>
-
-  <!-- Force slider -->
-  <div class="ctrl-group">
-    <label for="forceSlider">Field force:</label>
-    <input type="range" id="forceSlider" min="0" max="50000" value="180" step="1">
-    <span class="val-badge" id="forceBadge">180</span>
-  </div>
-
   <!-- Repulsion slider -->
   <div class="ctrl-group">
     <label for="repulsionSlider">Repulsion:</label>
@@ -203,12 +181,6 @@
     <label for="gravitySlider">Gravity:</label>
     <input type="range" id="gravitySlider" min="-1000" max="1000" value="0" step="10">
     <span class="val-badge" id="gravityBadge">0</span>
-  </div>
-
-  <!-- Vector field overlay toggle -->
-  <div class="ctrl-group">
-    <label for="vfOverlay">Vector field:</label>
-    <input type="checkbox" id="vfOverlay">
   </div>
 
   <!-- Cell placement -->
@@ -262,7 +234,6 @@ const densityStiffnessSl = document.getElementById('densityStiffnessSlider');
 const densityStiffnessBdg = document.getElementById('densityStiffnessBadge');
 const gravitySl    = document.getElementById('gravitySlider');
 const gravityBdg   = document.getElementById('gravityBadge');
-const vfOverlayCb  = document.getElementById('vfOverlay');
 const cellBtn      = document.getElementById('cellBtn');
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -290,11 +261,10 @@ const sim = {
 //  GPU state
 // ─────────────────────────────────────────────────────────────────────────────
 let device, context, canvasFormat;
-let particleBuf, fieldBuf, uniformBuf;
+let particleBuf, uniformBuf;
 let hashBuf, sortedIndexBuf, cellStartBuf, cellEndBuf;
 let hashPipeline, sortPipeline, cellIndexPipeline, updatePipeline, renderPipeline;
 let hashBG, sortBG, cellIndexBG, updateBG, renderBG;
-let showVectorField = false;
 let placingCell     = false;
 
 let particleCount = 0;
@@ -411,9 +381,9 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
 //  WGSL — Physics Update (compute)
 // ─────────────────────────────────────────────────────────────────────────────
 const UPDATE_WGSL = /* wgsl */`
-
 struct Particle { pos: vec2f, vel: vec2f, color: vec4f }
 struct HashEntry { hash: u32, index: u32 }
+
 struct Params {
   worldW: f32, worldH: f32,
   gridCols: u32, gridRows: u32,
@@ -428,32 +398,10 @@ struct Params {
 @group(0) @binding(3) var<storage, read> cellStart : array<u32>;
 @group(0) @binding(4) var<storage, read> cellEnd : array<u32>;
 
-const h = 40.0;  // smoothing radius
-const restDensity = 1.0;
-
-fn kernelPoly6(r: f32, h: f32) -> f32 {
-  if (r >= h) { return 0.0; }
-  let q = 1.0 - r / h;
-  return q * q;
-}
-
-fn getNeighbours(cellIdx: u32) -> array<u32, 9> {
-  var indices: array<u32, 9>;
-  let cellX = cellIdx % params.gridCols;
-  let cellY = cellIdx / params.gridCols;
-  
-  var count = 0u;
-  for (var dy: i32 = -1; dy <= 1; dy++) {
-    for (var dx: i32 = -1; dx <= 1; dx++) {
-      let nx = i32(cellX) + dx;
-      let ny = i32(cellY) + dy;
-      if (nx >= 0 && nx < i32(params.gridCols) && ny >= 0 && ny < i32(params.gridRows)) {
-        indices[count] = u32(nx) + u32(ny) * params.gridCols;
-        count++;
-      }
-    }
-  }
-  return indices;
+fn getCellIndex(pos: vec2f) -> u32 {
+  let cellX = clamp(u32(floor(pos.x / params.gridCellSize)), 0u, params.gridCols - 1u);
+  let cellY = clamp(u32(floor(pos.y / params.gridCellSize)), 0u, params.gridRows - 1u);
+  return cellX + cellY * params.gridCols;
 }
 
 @compute @workgroup_size(64)
@@ -462,99 +410,104 @@ fn main(@builtin(global_invocation_id) gid : vec3u) {
   if (idx >= params.count) { return; }
 
   var pt = pts[idx];
-  let cellX = u32(floor(pt.pos.x / params.gridCellSize));
-  let cellY = u32(floor(pt.pos.y / params.gridCellSize));
-  let cellIdx = clamp(cellX, 0u, params.gridCols - 1u) + clamp(cellY, 0u, params.gridRows - 1u) * params.gridCols;
 
-  // Get neighbouring cells
-  let neighbourCells = getNeighbours(cellIdx);
+  let baseCell = getCellIndex(pt.pos);
+  let baseX = baseCell % params.gridCols;
+  let baseY = baseCell / params.gridCols;
 
-  var density = 0.0;
-  var pressureForce = vec2f(0.0);
-  var viscosityForce = vec2f(0.0);
+  let radius = params.particleRadius;
+  let minDist = radius * 2.0;
 
-  // Iterate through all 9 neighbouring cells
-  for (var c = 0u; c < 9u; c++) {
-    let neighbourCell = neighbourCells[c];
-    let start = cellStart[neighbourCell];
-    let end = cellEnd[neighbourCell];
+  // ─────────────────────────────────────────────
+  // Neighbour collision loop (9 surrounding cells)
+  // ─────────────────────────────────────────────
+  for (var dy: i32 = -1; dy <= 1; dy++) {
+    for (var dx: i32 = -1; dx <= 1; dx++) {
 
-    for (var j = start; j < end; j++) {
-      if (j == idx) { continue; }
-      
-      let other = pts[j];
-      let delta = other.pos - pt.pos;
-      let dist = length(delta);
+      let nx = i32(baseX) + dx;
+      let ny = i32(baseY) + dy;
 
-      // SPH kernel density
-      if (dist < h) {
-        let q = 1.0 - dist / h;
-        density += q * q;
+      if (nx < 0 || ny < 0 ||
+          nx >= i32(params.gridCols) ||
+          ny >= i32(params.gridRows)) {
+        continue;
       }
 
-      // Collision response
-      let minDist = params.particleRadius * 2.0;
-      if (dist < minDist && dist > 0.001) {
-        let n = delta / dist;
-        let overlap = minDist - dist;
-        pt.pos += n * overlap * 0.5;
+      let neighbourCell = u32(nx) + u32(ny) * params.gridCols;
+      let start = cellStart[neighbourCell];
+      let end   = cellEnd[neighbourCell];
 
-        let relVel = dot(pt.vel - other.vel, n);
-        if (relVel < 0.0) {
-          let impulse = -(1.0 + params.restitution) * relVel * 0.5;
-          pt.vel += n * impulse;
+      // Skip empty cells
+      if (start >= end) { continue; }
+
+      for (var j = start; j < end; j++) {
+
+        let otherIndex = hashBuffer[j].index;
+        if (otherIndex == idx) { continue; }
+
+        let other = pts[otherIndex];
+
+        let delta = other.pos - pt.pos;
+        let dist = length(delta);
+
+        if (dist < minDist && dist > 0.0001) {
+          let n = delta / dist;
+          let overlap = minDist - dist;
+
+          // Position correction (separate particles)
+          pt.pos -= n * overlap * 0.5;
+
+          // Relative velocity along normal
+          let relVel = dot(pt.vel - other.vel, n);
+
+          if (relVel < 0.0) {
+            let impulse = -(1.0 + params.restitution) * relVel * 0.5;
+            pt.vel += n * impulse;
+          }
         }
       }
-
-      // Viscosity (smoothing velocity)
-      if (dist < h && dist > 0.001) {
-        pt.vel += (other.vel - pt.vel) * params.viscosity * params.dt;
-      }
     }
   }
 
-  // Pressure correction (SPH-lite density constraint)
-  let pressure = max(0.0, density - restDensity);
-  for (var c = 0u; c < 9u; c++) {
-    let neighbourCell = neighbourCells[c];
-    let start = cellStart[neighbourCell];
-    let end = cellEnd[neighbourCell];
-
-    for (var j = start; j < end; j++) {
-      if (j == idx) { continue; }
-      
-      let other = pts[j];
-      let delta = other.pos - pt.pos;
-      let dist = length(delta);
-
-      if (dist < h && dist > 0.001) {
-        let q = 1.0 - dist / h;
-        let n = delta / dist;
-        pt.pos -= n * pressure * q * params.densityStiffness * 0.5 * params.dt;
-      }
-    }
-  }
-
-  // Apply gravity
+  // ─────────────────────────────────────────────
+  // External forces
+  // ─────────────────────────────────────────────
   pt.vel.y += params.gravity * params.dt;
 
-  // Damping
+  // ─────────────────────────────────────────────
+  // Damping (energy loss)
+  // ─────────────────────────────────────────────
   pt.vel *= 0.995;
 
-  // Clamp speed
-  let spd = length(pt.vel);
-  let cap = params.worldW * 0.4;
-  if (spd > cap) { pt.vel = pt.vel / spd * cap; }
+  // ─────────────────────────────────────────────
+  // Integrate position
+  // ─────────────────────────────────────────────
+  pt.pos += pt.vel * params.dt;
 
-  // Euler integration
-  pt.pos = pt.pos + pt.vel * params.dt;
+  // ─────────────────────────────────────────────
+  // Boundary collision (reflection only)
+  // ─────────────────────────────────────────────
+  let r = radius;
 
-  // Boundary reflection
-  let r = params.particleRadius;
-  if (pt.pos.x < r) { pt.pos.x = r; pt.vel.x *= -params.restitution; }
-  if (pt.pos.x > params.worldW - r) { pt.pos.x = params.worldW - r; pt.vel.x *= -params.restitution; }
-  if (pt.pos.y < r) { pt.pos.y = r; pt.vel.y *= -params.restitution; }
-  if (pt.pos.y > params.worldH - r) { pt.pos.y = params.worldH - r; pt.vel.y *= -params.restitution; }
+  if (pt.pos.x < r) {
+    pt.pos.x = r;
+    pt.vel.x *= -params.restitution;
+  }
+
+  if (pt.pos.x > params.worldW - r) {
+    pt.pos.x = params.worldW - r;
+    pt.vel.x *= -params.restitution;
+  }
+
+  if (pt.pos.y < r) {
+    pt.pos.y = r;
+    pt.vel.y *= -params.restitution;
+  }
+
+  if (pt.pos.y > params.worldH - r) {
+    pt.pos.y = params.worldH - r;
+    pt.vel.y *= -params.restitution;
+  }
 
   pts[idx] = pt;
 }
@@ -632,91 +585,6 @@ fn fs(in : VOut) -> @location(0) vec4f {
 `;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  WGSL — vector-field overlay  (vertex + fragment, line-list arrows)
-// ─────────────────────────────────────────────────────────────────────────────
-const ARROW_WGSL = /* wgsl */`
-
-struct Params {
-  worldW   : f32, worldH   : f32,
-  gridCols : u32, gridRows : u32,
-  falloff  : f32, force    : f32,
-  count    : u32, dt       : f32,
-  radius   : f32, repulsion : f32, borderForce : f32, time : f32, gravity : f32,
-}
-
-@group(0) @binding(0) var<uniform>       params : Params;
-@group(0) @binding(1) var<storage, read> field  : array<vec2f>;
-
-struct VOut {
-  @builtin(position) pos   : vec4f,
-  @location(0)       alpha : f32,
-}
-
-@vertex
-fn vs(
-  @builtin(vertex_index)   vi : u32,
-  @builtin(instance_index) ii : u32,
-) -> VOut {
-  let col = ii % params.gridCols;
-  let row = ii / params.gridCols;
-
-  // Cell centre in world space
-  let cx = (f32(col) + 0.5) / f32(params.gridCols) * params.worldW;
-  let cy = (f32(row) + 0.5) / f32(params.gridRows) * params.worldH;
-  let center = vec2f(cx, cy);
-
-  let fVec = field[ii];
-  let mag  = length(fVec);
-
-  // Cell size — arrow length is a fixed fraction of the cell so it's
-  // always clearly visible; magnitude only controls alpha/brightness.
-  let cellW = params.worldW / f32(params.gridCols);
-  let cellH = params.worldH / f32(params.gridRows);
-  let halfCell = min(cellW, cellH) * 0.4;
-
-  // Normalised direction (skip drawing when magnitude ≈ 0)
-  var dir = vec2f(0.0, 0.0);
-  var drawAlpha = 0.0;
-  if (mag > 0.0001) {
-    dir = fVec / mag;
-    drawAlpha = clamp(mag * 0.08, 0.25, 0.85);
-  }
-  let perp = vec2f(-dir.y, dir.x);
-
-  let arrowLen = halfCell;
-  let tip      = center + dir * arrowLen;
-  let base     = center - dir * arrowLen;
-  let barbLen  = arrowLen * 0.4;
-
-  // 6 vertices forming 3 line segments (line-list):
-  //   0-1 = shaft,  2-3 = left barb,  4-5 = right barb
-  var worldPos = center;
-  if (vi == 0u) { worldPos = base; }
-  else if (vi == 1u) { worldPos = tip; }
-  else if (vi == 2u) { worldPos = tip; }
-  else if (vi == 3u) { worldPos = tip - dir * barbLen + perp * barbLen; }
-  else if (vi == 4u) { worldPos = tip; }
-  else if (vi == 5u) { worldPos = tip - dir * barbLen - perp * barbLen; }
-
-  let ndc = vec2f(
-     worldPos.x / params.worldW * 2.0 - 1.0,
-    -worldPos.y / params.worldH * 2.0 + 1.0,
-  );
-
-  var out : VOut;
-  out.pos   = vec4f(ndc, 0.0, 1.0);
-  out.alpha = f32(drawAlpha);
-  return out;
-}
-
-@fragment
-fn fs(in : VOut) -> @location(0) vec4f {
-  if (in.alpha < 0.01) { discard; }
-  return vec4f(0.45, 0.65, 1.0, in.alpha);
-}
-`;
-
-// ─────────────────────────────────────────────────────────────────────────────
 //  WebGPU initialisation
 // ─────────────────────────────────────────────────────────────────────────────
 async function initGPU() {
@@ -747,13 +615,6 @@ function createBuffers() {
   particleBuf = device.createBuffer({
     label: 'particles',
     size:  MAX_PARTICLES * PARTICLE_BYTES,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-  });
-
-  // vec2f = 8 bytes; pre-allocate for the largest possible grid
-  fieldBuf = device.createBuffer({
-    label: 'vectorField',
-    size:  MAX_GRID_DIM * MAX_GRID_DIM * 8,
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
@@ -820,10 +681,10 @@ function createPipelines() {
 
   renderPipeline = device.createRenderPipeline({
     layout:   'auto',
-    vertex:   { module: renderMod, entryPoint: 'vertexMain' },
+    vertex:   { module: renderMod, entryPoint: 'vs' },
     fragment: {
       module:  renderMod,
-      entryPoint: 'fragmentMain',
+      entryPoint: 'fs',
       targets: [{
         format: canvasFormat,
         blend: {
@@ -901,6 +762,10 @@ const _uniformAB = new ArrayBuffer(UNIFORM_BYTES);
 const _uniformDV = new DataView(_uniformAB);
 
 function uploadUniforms(dt) {
+  // Update grid dimensions dynamically based on world size and cell size
+  sim.gridCols = Math.min(MAX_GRID_DIM, Math.max(1, Math.ceil(sim.worldWidth / sim.gridCellSize)));
+  sim.gridRows = Math.min(MAX_GRID_DIM, Math.max(1, Math.ceil(sim.worldHeight / sim.gridCellSize)));
+
   _uniformDV.setFloat32( 0, sim.worldWidth,         true);
   _uniformDV.setFloat32( 4, sim.worldHeight,        true);
   _uniformDV.setUint32 ( 8, sim.gridCols,           true);
@@ -972,16 +837,6 @@ function addParticles(n) {
 
   device.queue.writeBuffer(particleBuf, particleCount * PARTICLE_BYTES, f32.buffer);
 
-  // Write cellLink data: food particles get ptype=5
-  const linkAB = new ArrayBuffer(toAdd * CELL_LINK_BYTES);
-  const linkBytes = new Uint8Array(linkAB);
-  linkBytes.fill(0xFF);  // sentinel for all
-  const linkDV = new DataView(linkAB);
-  for (let i = 0; i < foodCount; i++) {
-    linkDV.setUint32(i * CELL_LINK_BYTES + 28, 5, true);  // ptype = 5 (food)
-  }
-  device.queue.writeBuffer(cellLinkBuf, particleCount * CELL_LINK_BYTES, linkAB);
-
   particleCount += toAdd;
   setStatus(`Particles: ${particleCount}`);
 }
@@ -1028,11 +883,22 @@ function frame(ts) {
     hashPass.end();
 
     // ── Pass 2: Sort particles by hash ────────────────────────────────────
+    // TEMP: Disable broken bitonic sort pass until a proper GPU sort is implemented.
+    // Accept slower performance for now to guarantee correctness.
+    /*
     const sortPass = enc.beginComputePass({ label: 'sortByHash' });
     sortPass.setPipeline(sortPipeline);
     sortPass.setBindGroup(0, sortBG);
     sortPass.dispatchWorkgroups(Math.ceil(particleCount / 64));
     sortPass.end();
+    */
+
+    // Reset grid buffers before building cell index to prevent garbage memory bugs
+    const gridSize = sim.gridCols * sim.gridRows;
+    const clearStartData = new Uint32Array(gridSize).fill(0xFFFFFFFF);
+    const clearEndData = new Uint32Array(gridSize).fill(0);
+    device.queue.writeBuffer(cellStartBuf, 0, clearStartData.buffer, 0, gridSize * 4);
+    device.queue.writeBuffer(cellEndBuf, 0, clearEndData.buffer, 0, gridSize * 4);
 
     // ── Pass 3: Build cell start/end indices ──────────────────────────────
     const cellIdxPass = enc.beginComputePass({ label: 'buildCellIndex' });
@@ -1124,10 +990,6 @@ function wireUI() {
   gravitySl.addEventListener('input', () => {
     sim.gravity = parseInt(gravitySl.value, 10);
     gravityBdg.textContent = gravitySl.value;
-  });
-
-  vfOverlayCb.addEventListener('change', () => {
-    showVectorField = vfOverlayCb.checked;
   });
 
   cellBtn.addEventListener('click', () => {
